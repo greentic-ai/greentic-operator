@@ -25,11 +25,13 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
+            ~/.cargo/binstall
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - uses: cargo-bins/cargo-binstall@v1.6.2
       - name: Install Greentic CLIs
-        run: cargo binstall -y greentic-pack
+        run: cargo binstall -y --force greentic-pack greentic-runner-desktop
       - name: Format
         run: cargo fmt --check
 
