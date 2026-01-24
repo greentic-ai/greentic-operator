@@ -2234,10 +2234,8 @@ fn read_public_base_url(root: &Path, tenant: &str, team: Option<&str>) -> Option
     let team_id = team.unwrap_or("default");
     let paths = crate::runtime_state::RuntimePaths::new(root.join("state"), tenant, team_id);
     let path = crate::cloudflared::public_url_path(&paths);
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let contents = std::fs::read_to_string(path).ok()?;
+    crate::cloudflared::parse_public_url(&contents)
 }
 
 impl From<DomainArg> for Domain {

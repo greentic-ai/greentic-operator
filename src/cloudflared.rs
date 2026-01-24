@@ -76,16 +76,23 @@ pub fn public_url_path(paths: &RuntimePaths) -> PathBuf {
     paths.runtime_root().join("public_base_url.txt")
 }
 
+pub fn parse_public_url(contents: &str) -> Option<String> {
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_clean_trycloudflare_url(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    find_url_in_text(contents)
+}
+
 fn read_public_url(path: &Path) -> anyhow::Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
     let contents = std::fs::read_to_string(path)?;
-    let trimmed = contents.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(trimmed.to_string()))
+    Ok(parse_public_url(&contents))
 }
 
 fn write_public_url(path: &Path, url: &str) -> anyhow::Result<()> {
@@ -116,13 +123,29 @@ fn find_url_in_text(contents: &str) -> Option<String> {
     while let Some(pos) = contents[offset..].find("https://") {
         let start = offset + pos;
         let tail = &contents[start..];
-        if let Some(end_pos) = tail.find(URL_SUFFIX) {
-            let end = start + end_pos + URL_SUFFIX.len();
-            return Some(contents[start..end].to_string());
+        let end_offset = tail
+            .find(char::is_whitespace)
+            .unwrap_or_else(|| tail.len());
+        let mut candidate = &contents[start..start + end_offset];
+        candidate = candidate.trim_end_matches(|ch: char| {
+            matches!(ch, ')' | ',' | '|' | '"' | '\'' | ']' | '>' | '<')
+        });
+        if candidate.ends_with(URL_SUFFIX) {
+            return Some(candidate.to_string());
         }
         offset = start + "https://".len();
     }
     None
+}
+
+fn is_clean_trycloudflare_url(value: &str) -> bool {
+    if !value.starts_with("https://") {
+        return false;
+    }
+    if value.contains(char::is_whitespace) {
+        return false;
+    }
+    value.ends_with(URL_SUFFIX)
 }
 
 fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {

@@ -31,7 +31,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - uses: cargo-bins/cargo-binstall@v1.6.2
       - name: Install Greentic CLIs
-        run: cargo binstall -y --force greentic-pack greentic-runner-desktop
+        run: cargo binstall -y greentic-pack
       - name: Format
         run: cargo fmt --check
 

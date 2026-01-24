@@ -1,6 +1,6 @@
 [package]
 name = "greentic-operator"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.90"
 description = "Greentic operator CLI for local dev and demo orchestration."
@@ -18,7 +18,7 @@ zip = "7"
 chrono = "0.4"
 sysinfo = "0.37"
 directories-next = "2"
-greentic-runner-desktop = { version = "0.4", path = "../greentic-runner/crates/greentic-runner-desktop" }
+greentic-runner-desktop = { version = "0.4" }
 
 [dev-dependencies]
 tempfile = "3.10"
