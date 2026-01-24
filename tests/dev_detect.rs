@@ -44,7 +44,7 @@ fn detect_repo_map_handles_ambiguity() {
     .unwrap();
 
     assert_eq!(result.unambiguous.get("bar"), Some(&"repoB".to_string()));
-    assert!(result.unambiguous.get("foo").is_none());
+    assert!(!result.unambiguous.contains_key("foo"));
     let repos = result.ambiguous.get("foo").unwrap();
     assert!(repos.contains(&"repoA".to_string()));
     assert!(repos.contains(&"repoC".to_string()));

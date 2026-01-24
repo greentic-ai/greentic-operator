@@ -5,6 +5,7 @@ pub mod config;
 pub mod demo;
 pub mod dev_detect;
 pub mod dev_mode;
+pub mod discovery;
 pub mod doctor;
 pub mod domains;
 pub mod gmap;

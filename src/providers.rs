@@ -9,6 +9,7 @@ use crate::config::{DemoConfig, DemoProviderConfig};
 use crate::dev_mode::DevSettingsResolved;
 use crate::runner_integration;
 use crate::runtime_state::RuntimePaths;
+use greentic_runner_desktop::{RunResult, RunStatus};
 
 pub struct ProviderSetupOptions {
     pub providers: Option<Vec<String>>,
@@ -217,7 +218,7 @@ fn build_input(
     Ok(payload)
 }
 
-fn write_run_output(
+pub(crate) fn write_run_output(
     path: &Path,
     provider: &str,
     flow: &str,
@@ -235,6 +236,31 @@ fn write_run_output(
         stdout: output.stdout.clone(),
         stderr: output.stderr.clone(),
         parsed: output.parsed.clone(),
+        timestamp: Utc::now(),
+    };
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+pub(crate) fn write_run_result(
+    path: &Path,
+    provider: &str,
+    flow: &str,
+    result: &RunResult,
+) -> anyhow::Result<()> {
+    let parsed = serde_json::to_value(result).ok();
+    let record = ProviderRunRecord {
+        provider: provider.to_string(),
+        flow: flow.to_string(),
+        status: format!("{:?}", result.status),
+        success: result.status == RunStatus::Success,
+        stdout: String::new(),
+        stderr: result.error.clone().unwrap_or_default(),
+        parsed,
         timestamp: Utc::now(),
     };
     let bytes = serde_json::to_vec_pretty(&record)?;

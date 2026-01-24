@@ -9,11 +9,14 @@ use crate::dev_mode::{
     DevCliOverrides, DevMode, DevProfile, DevSettingsResolved, effective_dev_settings,
     merge_settings,
 };
+use crate::discovery;
 use crate::domains::{self, Domain, DomainAction};
 use crate::gmap::{self, Policy};
 use crate::project::{self, ScanFormat};
 use crate::runner_exec;
+use crate::runner_integration;
 use crate::settings;
+use crate::state_layout;
 
 mod dev_mode_cmd;
 mod dev_secrets;
@@ -526,7 +529,7 @@ enum DemoSetupDomainArg {
 #[command(
     about = "Run provider setup flows against a demo bundle.",
     long_about = "Executes setup flows for provider packs included in the bundle.",
-    after_help = "Main options:\n  --bundle <DIR>\n  --tenant <TENANT>\n\nOptional options:\n  --team <TEAM>\n  --domain <messaging|events|secrets|all> (default: all)\n  --provider <FILTER>\n  --dry-run\n  --format <text|json|yaml> (default: text)\n  --parallel <N> (default: 1)\n  --allow-missing-setup\n  --online\n  --secrets-env <ENV>\n  --secrets-bin <PATH>\n  --skip-secrets-init"
+    after_help = "Main options:\n  --bundle <DIR>\n  --tenant <TENANT>\n\nOptional options:\n  --team <TEAM>\n  --domain <messaging|events|secrets|all> (default: all)\n  --provider <FILTER>\n  --dry-run\n  --format <text|json|yaml> (default: text)\n  --parallel <N> (default: 1)\n  --allow-missing-setup\n  --online\n  --secrets-env <ENV>\n  --secrets-bin <PATH>\n  --skip-secrets-init\n  --runner-binary <PATH>\n  --best-effort"
 )]
 struct DemoSetupArgs {
     #[arg(long)]
@@ -557,6 +560,10 @@ struct DemoSetupArgs {
     skip_secrets_init: bool,
     #[arg(long)]
     state_dir: Option<PathBuf>,
+    #[arg(long)]
+    runner_binary: Option<PathBuf>,
+    #[arg(long)]
+    best_effort: bool,
 }
 #[derive(Parser)]
 #[command(
@@ -880,18 +887,20 @@ impl DevUpArgs {
         let root = project_root(self.project_root)?;
         let config = config::load_operator_config(&root)?;
         let dev_settings = resolve_dev_settings(&ctx.settings, config.as_ref(), &self.dev, &root)?;
-        let messaging_binary = config::messaging_binary(config.as_ref(), &root);
-        let command = bin_resolver::resolve_binary(
-            &messaging_binary.name,
-            &ResolveCtx {
-                config_dir: root.clone(),
-                dev: dev_settings.clone(),
-                explicit_path: messaging_binary.explicit_path,
-            },
-        )?;
+        let discovery = discovery::discover(&root)?;
+        discovery::persist(&root, &self.tenant, &discovery)?;
+        let services = config
+            .as_ref()
+            .and_then(|config| config.services.clone())
+            .unwrap_or_default();
+        let messaging_enabled = services
+            .messaging
+            .enabled
+            .is_enabled(discovery.domains.messaging);
+        let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
 
         let mut nats_url = self.nats_url.clone();
-        if !self.no_nats && nats_url.is_none() {
+        if !self.no_nats && nats_url.is_none() && (messaging_enabled || events_enabled) {
             if let Err(err) = crate::services::start_nats(&root) {
                 eprintln!("Warning: failed to start NATS: {err}");
             } else {
@@ -899,14 +908,38 @@ impl DevUpArgs {
             }
         }
 
-        let state = crate::services::start_messaging_with_command(
-            &root,
-            &self.tenant,
-            self.team.as_deref(),
-            nats_url.as_deref(),
-            &command.to_string_lossy(),
-        )?;
-        println!("messaging: {:?}", state);
+        if messaging_enabled {
+            let messaging_binary = config::messaging_binary(config.as_ref(), &root);
+            let command = bin_resolver::resolve_binary(
+                &messaging_binary.name,
+                &ResolveCtx {
+                    config_dir: root.clone(),
+                    dev: dev_settings.clone(),
+                    explicit_path: messaging_binary.explicit_path,
+                },
+            )?;
+            let state = crate::services::start_messaging_with_command(
+                &root,
+                &self.tenant,
+                self.team.as_deref(),
+                nats_url.as_deref(),
+                &command.to_string_lossy(),
+            )?;
+            println!("messaging: {:?}", state);
+        } else {
+            println!("messaging: skipped (disabled or no providers)");
+        }
+
+        if events_enabled {
+            let envs = build_domain_env(&self.tenant, self.team.as_deref(), nats_url.as_deref());
+            for spec in resolve_event_components(&root, config.as_ref(), &services, &dev_settings)?
+            {
+                let state = crate::services::start_component(&root, &spec, &envs)?;
+                println!("{}: {:?}", spec.id, state);
+            }
+        } else {
+            println!("events: skipped (disabled or no providers)");
+        }
         Ok(())
     }
 }
@@ -914,8 +947,18 @@ impl DevUpArgs {
 impl DevDownArgs {
     fn run(self) -> anyhow::Result<()> {
         let root = project_root(self.project_root)?;
+        let config = config::load_operator_config(&root)?;
+        let services = config
+            .as_ref()
+            .and_then(|config| config.services.clone())
+            .unwrap_or_default();
         let state = crate::services::stop_messaging(&root, &self.tenant, self.team.as_deref())?;
         println!("messaging: {:?}", state);
+
+        for id in event_component_ids(&services) {
+            let state = crate::services::stop_component(&root, &id)?;
+            println!("{id}: {:?}", state);
+        }
 
         if !self.no_nats {
             let nats = crate::services::stop_nats(&root)?;
@@ -928,9 +971,45 @@ impl DevDownArgs {
 impl DevStatusArgs {
     fn run(self) -> anyhow::Result<()> {
         let root = project_root(self.project_root)?;
-        let messaging =
-            crate::services::messaging_status(&root, &self.tenant, self.team.as_deref())?;
-        println!("messaging: {:?}", messaging);
+        let config = config::load_operator_config(&root)?;
+        let discovery = discovery::discover(&root)?;
+        discovery::persist(&root, &self.tenant, &discovery)?;
+        println!(
+            "detected domains: messaging={} events={}",
+            discovery.domains.messaging, discovery.domains.events
+        );
+        for provider in &discovery.providers {
+            println!(
+                "detected provider: {} ({} via {:?})",
+                provider.provider_id, provider.domain, provider.id_source
+            );
+        }
+        let services = config
+            .as_ref()
+            .and_then(|config| config.services.clone())
+            .unwrap_or_default();
+        let messaging_enabled = services
+            .messaging
+            .enabled
+            .is_enabled(discovery.domains.messaging);
+        let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
+
+        if messaging_enabled {
+            let messaging =
+                crate::services::messaging_status(&root, &self.tenant, self.team.as_deref())?;
+            println!("messaging: {:?}", messaging);
+        } else {
+            println!("messaging: skipped (disabled or no providers)");
+        }
+
+        if events_enabled {
+            for id in event_component_ids(&services) {
+                let status = crate::services::component_status(&root, &id)?;
+                println!("{id}: {:?}", status);
+            }
+        } else {
+            println!("events: skipped (disabled or no providers)");
+        }
 
         if !self.no_nats {
             let nats = crate::services::nats_status(&root)?;
@@ -970,6 +1049,9 @@ impl DomainSetupArgs {
             online: self.online,
             secrets_env: self.secrets_env,
             secrets_bin: self.secrets_bin,
+            runner_binary: None,
+            best_effort: false,
+            discovered_providers: None,
         })
     }
 }
@@ -992,6 +1074,9 @@ impl DomainDiagnosticsArgs {
             online: self.online,
             secrets_env: None,
             secrets_bin: None,
+            runner_binary: None,
+            best_effort: false,
+            discovered_providers: None,
         })
     }
 }
@@ -1014,6 +1099,9 @@ impl DomainVerifyArgs {
             online: self.online,
             secrets_env: None,
             secrets_bin: None,
+            runner_binary: None,
+            best_effort: false,
+            discovered_providers: None,
         })
     }
 }
@@ -1114,15 +1202,36 @@ impl DemoUpArgs {
             let config = config::load_operator_config(&bundle)?;
             let dev_settings =
                 resolve_dev_settings(&ctx.settings, config.as_ref(), &self.dev, &bundle)?;
-            let messaging_binary = config::messaging_binary(config.as_ref(), &bundle);
-            let command = bin_resolver::resolve_binary(
-                &messaging_binary.name,
-                &ResolveCtx {
-                    config_dir: bundle.clone(),
-                    dev: dev_settings,
-                    explicit_path: messaging_binary.explicit_path,
-                },
-            )?;
+            let discovery = discovery::discover(&bundle)?;
+            discovery::persist(&bundle, &tenant, &discovery)?;
+            let services = config
+                .as_ref()
+                .and_then(|config| config.services.clone())
+                .unwrap_or_default();
+            let messaging_enabled = services
+                .messaging
+                .enabled
+                .is_enabled(discovery.domains.messaging);
+            let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
+            let messaging_command = if messaging_enabled {
+                let messaging_binary = config::messaging_binary(config.as_ref(), &bundle);
+                let command = bin_resolver::resolve_binary(
+                    &messaging_binary.name,
+                    &ResolveCtx {
+                        config_dir: bundle.clone(),
+                        dev: dev_settings.clone(),
+                        explicit_path: messaging_binary.explicit_path,
+                    },
+                )?;
+                Some(command.to_string_lossy().to_string())
+            } else {
+                None
+            };
+            let events_components = if events_enabled {
+                resolve_event_components(&bundle, config.as_ref(), &services, &dev_settings)?
+            } else {
+                Vec::new()
+            };
             let cloudflared = match self.cloudflared {
                 CloudflaredModeArg::Off => None,
                 CloudflaredModeArg::On => {
@@ -1150,8 +1259,9 @@ impl DemoUpArgs {
                 self.team.as_deref(),
                 self.nats_url.as_deref(),
                 self.no_nats,
-                &command.to_string_lossy(),
+                messaging_command.as_deref(),
                 cloudflared,
+                events_components,
             );
         }
 
@@ -1213,11 +1323,23 @@ impl DemoUpArgs {
 
 impl DemoSetupArgs {
     fn run(self) -> anyhow::Result<()> {
+        let discovery = discovery::discover(&self.bundle)?;
+        discovery::persist(&self.bundle, &self.tenant, &discovery)?;
         let domains: Vec<Domain> = match self.domain {
             DemoSetupDomainArg::Messaging => vec![Domain::Messaging],
             DemoSetupDomainArg::Events => vec![Domain::Events],
             DemoSetupDomainArg::Secrets => vec![Domain::Secrets],
-            DemoSetupDomainArg::All => vec![Domain::Messaging, Domain::Events, Domain::Secrets],
+            DemoSetupDomainArg::All => {
+                let mut enabled = Vec::new();
+                if discovery.domains.messaging {
+                    enabled.push(Domain::Messaging);
+                }
+                if discovery.domains.events {
+                    enabled.push(Domain::Events);
+                }
+                enabled.push(Domain::Secrets);
+                enabled
+            }
         };
         if demo_debug_enabled() {
             println!(
@@ -1238,6 +1360,17 @@ impl DemoSetupArgs {
             Format::Yaml => PlanFormat::Yaml,
         };
         for domain in domains {
+            let discovered_providers = match domain {
+                Domain::Messaging | Domain::Events => Some(
+                    discovery
+                        .providers
+                        .iter()
+                        .filter(|provider| provider.domain == domains::domain_name(domain))
+                        .cloned()
+                        .collect(),
+                ),
+                Domain::Secrets => None,
+            };
             run_domain_command(DomainRunArgs {
                 root: self.bundle.clone(),
                 state_root: self.state_dir.clone(),
@@ -1261,6 +1394,9 @@ impl DemoSetupArgs {
                 } else {
                     self.secrets_bin.clone()
                 },
+                runner_binary: self.runner_binary.clone(),
+                best_effort: self.best_effort,
+                discovered_providers,
             })?;
         }
         Ok(())
@@ -1551,30 +1687,54 @@ struct DomainRunArgs {
     online: bool,
     secrets_env: Option<String>,
     secrets_bin: Option<PathBuf>,
+    runner_binary: Option<PathBuf>,
+    best_effort: bool,
+    discovered_providers: Option<Vec<discovery::DetectedProvider>>,
 }
 
 fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
     let is_demo_bundle = args.root.join("greentic.demo.yaml").exists();
     let mut packs = domains::discover_provider_packs(&args.root, args.domain)?;
-    if is_demo_bundle {
-        if let Some(allowed) =
+    let provider_map = args.discovered_providers.as_ref().map(|providers| {
+        let mut map = std::collections::BTreeMap::new();
+        for provider in providers {
+            map.insert(provider.pack_path.clone(), provider.clone());
+        }
+        map
+    });
+    if let Some(provider_map) = provider_map.as_ref() {
+        packs.retain(|pack| provider_map.contains_key(&pack.path));
+        packs.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+    if is_demo_bundle
+        && let Some(allowed) =
             demo_provider_files(&args.root, &args.tenant, args.team.as_deref(), args.domain)?
-        {
-            packs.retain(|pack| allowed.contains(&pack.file_name));
+    {
+        packs.retain(|pack| allowed.contains(&pack.file_name));
+    }
+    if args.action == DomainAction::Setup {
+        let setup_flow = domains::config(args.domain).setup_flow;
+        let missing: Vec<String> = packs
+            .iter()
+            .filter(|pack| !pack.entry_flows.iter().any(|flow| flow == setup_flow))
+            .map(|pack| pack.file_name.clone())
+            .collect();
+        if !missing.is_empty() && !args.allow_missing_setup {
+            if args.best_effort {
+                println!(
+                    "Best-effort: skipped {} pack(s) missing {setup_flow}.",
+                    missing.len()
+                );
+                packs.retain(|pack| pack.entry_flows.iter().any(|flow| flow == setup_flow));
+            } else {
+                return Err(anyhow::anyhow!(
+                    "missing {setup_flow} in packs: {}",
+                    missing.join(", ")
+                ));
+            }
         }
     }
     if packs.is_empty() {
-        if is_demo_bundle {
-            println!(
-                "No provider packs found under {}. If you expected providers, rebuild the bundle.",
-                args.root.display()
-            );
-        } else {
-            println!(
-                "No provider packs found under {} (use --project-root to point at your project).",
-                args.root.display()
-            );
-        }
         return Ok(());
     }
     let plan = domains::plan_runs(
@@ -1589,9 +1749,7 @@ fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
         if is_demo_bundle {
             println!("No provider packs matched. Try --provider <pack_id>.");
         } else {
-            println!(
-                "No provider packs matched. Try --provider <pack_id> or --project-root."
-            );
+            println!("No provider packs matched. Try --provider <pack_id> or --project-root.");
         }
         return Ok(());
     }
@@ -1601,6 +1759,7 @@ fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let runner_binary = resolve_demo_runner_binary(&args.root, args.runner_binary)?;
     let dist_offline = !args.online;
     let state_root = args.state_root.as_ref().unwrap_or(&args.root);
     run_plan(
@@ -1615,6 +1774,9 @@ fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
         dist_offline,
         args.secrets_env.as_deref(),
         args.secrets_bin.as_deref(),
+        runner_binary,
+        args.best_effort,
+        provider_map,
     )
 }
 
@@ -1631,10 +1793,14 @@ fn run_plan(
     dist_offline: bool,
     secrets_env: Option<&str>,
     secrets_bin: Option<&Path>,
+    runner_binary: Option<PathBuf>,
+    best_effort: bool,
+    provider_map: Option<std::collections::BTreeMap<PathBuf, discovery::DetectedProvider>>,
 ) -> anyhow::Result<()> {
     if parallel <= 1 {
+        let mut errors = Vec::new();
         for item in plan {
-            run_plan_item(
+            let result = run_plan_item(
                 root,
                 state_root,
                 domain,
@@ -1645,7 +1811,20 @@ fn run_plan(
                 dist_offline,
                 secrets_env,
                 secrets_bin,
-            )?;
+                runner_binary.as_deref(),
+                provider_map.as_ref(),
+            );
+            if let Err(err) = result {
+                if best_effort {
+                    errors.push(err);
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+        if best_effort && !errors.is_empty() {
+            println!("Best-effort: {} flow(s) failed.", errors.len());
+            return Ok(());
         }
         return Ok(());
     }
@@ -1663,6 +1842,8 @@ fn run_plan(
         let team = team.map(|value| value.to_string());
         let secrets_env = secrets_env.map(|value| value.to_string());
         let secrets_bin = secrets_bin.map(|value| value.to_path_buf());
+        let runner_binary = runner_binary.clone();
+        let provider_map = provider_map.clone();
         handles.push(std::thread::spawn(move || {
             loop {
                 let next = {
@@ -1683,6 +1864,8 @@ fn run_plan(
                     dist_offline,
                     secrets_env.as_deref(),
                     secrets_bin.as_deref(),
+                    runner_binary.as_deref(),
+                    provider_map.as_ref(),
                 );
                 if let Err(err) = result {
                     errors.lock().unwrap().push(err);
@@ -1697,6 +1880,10 @@ fn run_plan(
 
     let errors = errors.lock().unwrap();
     if !errors.is_empty() {
+        if best_effort {
+            println!("Best-effort: {} flow(s) failed.", errors.len());
+            return Ok(());
+        }
         return Err(anyhow::anyhow!("{} flow(s) failed.", errors.len()));
     }
     Ok(())
@@ -1736,23 +1923,95 @@ fn run_plan_item(
     dist_offline: bool,
     secrets_env: Option<&str>,
     secrets_bin: Option<&Path>,
+    runner_binary: Option<&Path>,
+    provider_map: Option<&std::collections::BTreeMap<PathBuf, discovery::DetectedProvider>>,
 ) -> anyhow::Result<()> {
     let input = build_input_payload(state_root, domain, tenant, team);
-    let output = runner_exec::run_provider_pack_flow(runner_exec::RunRequest {
-        root: state_root.to_path_buf(),
-        domain,
-        pack_path: item.pack.path.clone(),
-        pack_label: item.pack.pack_id.clone(),
-        flow_id: item.flow_id.clone(),
-        tenant: tenant.to_string(),
-        team: team.map(|value| value.to_string()),
-        input,
-        dist_offline,
-    })?;
-    println!(
-        "{} {} -> {:?}",
-        item.pack.file_name, item.flow_id, output.result.status
-    );
+    if demo_debug_enabled() {
+        println!(
+            "[demo] setup input pack={} flow={} input={}",
+            item.pack.file_name,
+            item.flow_id,
+            serde_json::to_string(&input).unwrap_or_else(|_| "<invalid-json>".to_string())
+        );
+    }
+    if let Some(runner_binary) = runner_binary {
+        let run_dir = state_layout::run_dir(state_root, domain, &item.pack.pack_id, &item.flow_id)?;
+        std::fs::create_dir_all(&run_dir)?;
+        let input_path = run_dir.join("input.json");
+        let input_json = serde_json::to_string_pretty(&input)?;
+        std::fs::write(&input_path, input_json)?;
+
+        let runner_flavor = runner_integration::detect_runner_flavor(runner_binary);
+        let output = runner_integration::run_flow_with_options(
+            runner_binary,
+            &item.pack.path,
+            &item.flow_id,
+            &input,
+            runner_integration::RunFlowOptions {
+                dist_offline,
+                tenant: Some(tenant),
+                team,
+                artifacts_dir: Some(&run_dir),
+                runner_flavor,
+            },
+        )?;
+        write_runner_cli_artifacts(&run_dir, &output)?;
+        if action == DomainAction::Setup {
+            let provider_id =
+                provider_id_for_pack(&item.pack.path, &item.pack.pack_id, provider_map);
+            let providers_root = state_root
+                .join("state")
+                .join("runtime")
+                .join(tenant)
+                .join("providers");
+            let setup_path = providers_root.join(format!("{provider_id}.setup.json"));
+            crate::providers::write_run_output(&setup_path, &provider_id, &item.flow_id, &output)?;
+        }
+        let exit = format_runner_exit(&output);
+        if output.status.success() {
+            println!("{} {} -> {}", item.pack.file_name, item.flow_id, exit);
+        } else if let Some(summary) = summarize_runner_error(&output) {
+            println!(
+                "{} {} -> {} ({})",
+                item.pack.file_name, item.flow_id, exit, summary
+            );
+        } else {
+            println!("{} {} -> {}", item.pack.file_name, item.flow_id, exit);
+        }
+    } else {
+        let output = runner_exec::run_provider_pack_flow(runner_exec::RunRequest {
+            root: state_root.to_path_buf(),
+            domain,
+            pack_path: item.pack.path.clone(),
+            pack_label: item.pack.pack_id.clone(),
+            flow_id: item.flow_id.clone(),
+            tenant: tenant.to_string(),
+            team: team.map(|value| value.to_string()),
+            input,
+            dist_offline,
+        })?;
+        if action == DomainAction::Setup {
+            let provider_id =
+                provider_id_for_pack(&item.pack.path, &item.pack.pack_id, provider_map);
+            let providers_root = state_root
+                .join("state")
+                .join("runtime")
+                .join(tenant)
+                .join("providers");
+            let setup_path = providers_root.join(format!("{provider_id}.setup.json"));
+            crate::providers::write_run_result(
+                &setup_path,
+                &provider_id,
+                &item.flow_id,
+                &output.result,
+            )?;
+        }
+        println!(
+            "{} {} -> {:?}",
+            item.pack.file_name, item.flow_id, output.result.status
+        );
+    }
 
     if domain == Domain::Messaging && action == DomainAction::Setup {
         let setup_flow = domains::config(domain).setup_flow;
@@ -1781,6 +2040,167 @@ fn run_plan_item(
         }
     }
     Ok(())
+}
+
+fn resolve_demo_runner_binary(
+    config_dir: &Path,
+    runner_binary: Option<PathBuf>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(runner_binary) = runner_binary else {
+        return Ok(None);
+    };
+    let runner_str = runner_binary.to_string_lossy();
+    let (name, explicit) = if looks_like_path_str(&runner_str) {
+        let name = runner_binary
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("greentic-runner")
+            .to_string();
+        (name, Some(runner_binary))
+    } else {
+        (runner_str.to_string(), None)
+    };
+    let resolved = bin_resolver::resolve_binary(
+        &name,
+        &ResolveCtx {
+            config_dir: config_dir.to_path_buf(),
+            dev: None,
+            explicit_path: explicit,
+        },
+    )?;
+    Ok(Some(resolved))
+}
+
+fn write_runner_cli_artifacts(
+    run_dir: &Path,
+    output: &runner_integration::RunnerOutput,
+) -> anyhow::Result<()> {
+    let run_json = run_dir.join("run.json");
+    let summary_path = run_dir.join("summary.txt");
+    let stdout_path = run_dir.join("stdout.txt");
+    let stderr_path = run_dir.join("stderr.txt");
+
+    let json = serde_json::json!({
+        "status": {
+            "success": output.status.success(),
+            "code": output.status.code(),
+        },
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "parsed": output.parsed,
+    });
+    let json = serde_json::to_string_pretty(&json)?;
+    std::fs::write(run_json, json)?;
+    std::fs::write(stdout_path, &output.stdout)?;
+    std::fs::write(stderr_path, &output.stderr)?;
+
+    let summary = format!(
+        "success: {}\nexit_code: {}\n",
+        output.status.success(),
+        output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_string())
+    );
+    std::fs::write(summary_path, summary)?;
+    Ok(())
+}
+
+fn format_runner_exit(output: &runner_integration::RunnerOutput) -> String {
+    if let Some(code) = output.status.code() {
+        return format!("exit={code}");
+    }
+    if output.status.success() {
+        return "exit=0".to_string();
+    }
+    "exit=signal".to_string()
+}
+
+fn summarize_runner_error(output: &runner_integration::RunnerOutput) -> Option<String> {
+    output
+        .stderr
+        .lines()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string())
+}
+
+fn build_domain_env(
+    tenant: &str,
+    team: Option<&str>,
+    nats_url: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut envs = Vec::new();
+    envs.push(("GREENTIC_TENANT", tenant.to_string()));
+    if let Some(team) = team {
+        envs.push(("GREENTIC_TEAM", team.to_string()));
+    }
+    if let Some(nats_url) = nats_url {
+        envs.push(("NATS_URL", nats_url.to_string()));
+    }
+    envs
+}
+
+fn event_component_ids(services: &config::OperatorServicesConfig) -> Vec<String> {
+    event_components(services)
+        .into_iter()
+        .map(|component| component.id)
+        .collect()
+}
+
+fn resolve_event_components(
+    root: &Path,
+    config: Option<&config::OperatorConfig>,
+    services: &config::OperatorServicesConfig,
+    dev_settings: &Option<DevSettingsResolved>,
+) -> anyhow::Result<Vec<crate::services::ComponentSpec>> {
+    let mut specs = Vec::new();
+    for component in event_components(services) {
+        let explicit = if looks_like_path_str(&component.binary) {
+            Some(PathBuf::from(&component.binary))
+        } else {
+            config::binary_override(config, &component.binary, root)
+        };
+        let resolved = bin_resolver::resolve_binary(
+            &component.binary,
+            &ResolveCtx {
+                config_dir: root.to_path_buf(),
+                dev: dev_settings.clone(),
+                explicit_path: explicit,
+            },
+        )?;
+        specs.push(crate::services::ComponentSpec {
+            id: component.id,
+            binary: resolved.to_string_lossy().to_string(),
+            args: component.args,
+        });
+    }
+    Ok(specs)
+}
+
+fn event_components(
+    services: &config::OperatorServicesConfig,
+) -> Vec<config::ServiceComponentConfig> {
+    if services.events.components.is_empty() {
+        return config::default_events_components();
+    }
+    services.events.components.clone()
+}
+
+fn provider_id_for_pack(
+    pack_path: &Path,
+    fallback: &str,
+    provider_map: Option<&std::collections::BTreeMap<PathBuf, discovery::DetectedProvider>>,
+) -> String {
+    provider_map
+        .and_then(|map| map.get(pack_path))
+        .map(|provider| provider.provider_id.clone())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn looks_like_path_str(value: &str) -> bool {
+    value.contains('/') || value.contains('\\') || Path::new(value).is_absolute()
 }
 
 fn build_input_payload(
@@ -1814,7 +2234,10 @@ fn read_public_base_url(root: &Path, tenant: &str, team: Option<&str>) -> Option
     let team_id = team.unwrap_or("default");
     let paths = crate::runtime_state::RuntimePaths::new(root.join("state"), tenant, team_id);
     let path = crate::cloudflared::public_url_path(&paths);
-    std::fs::read_to_string(path).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 impl From<DomainArg> for Domain {

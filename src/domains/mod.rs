@@ -161,6 +161,14 @@ pub fn plan_runs(
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct PackManifestForDiscovery {
+    #[serde(default)]
+    pub meta: Option<PackMeta>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PackManifest {
     #[serde(default)]
     meta: Option<PackMeta>,
@@ -171,8 +179,8 @@ struct PackManifest {
 }
 
 #[derive(Debug, Deserialize)]
-struct PackMeta {
-    pack_id: String,
+pub(crate) struct PackMeta {
+    pub pack_id: String,
     #[serde(default)]
     entry_flows: Vec<String>,
 }
@@ -225,7 +233,7 @@ fn read_pack_manifest(path: &Path) -> anyhow::Result<PackManifest> {
     })
 }
 
-fn domain_name(domain: Domain) -> &'static str {
+pub(crate) fn domain_name(domain: Domain) -> &'static str {
     match domain {
         Domain::Messaging => "messaging",
         Domain::Events => "events",

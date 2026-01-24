@@ -163,7 +163,8 @@ fn should_restart_for_command(pid: u32, command: &str) -> anyhow::Result<bool> {
     if !command_path.is_absolute() {
         return Ok(false);
     }
-    let command_path = std::fs::canonicalize(command_path).unwrap_or_else(|_| command_path.to_path_buf());
+    let command_path =
+        std::fs::canonicalize(command_path).unwrap_or_else(|_| command_path.to_path_buf());
     let Some(proc_path) = process_exe(pid) else {
         return Ok(false);
     };
@@ -175,7 +176,10 @@ fn process_exe(pid: u32) -> Option<PathBuf> {
     let mut system = System::new();
     let pid = Pid::from_u32(pid);
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    system.process(pid).and_then(|process| process.exe()).map(|path| path.to_path_buf())
+    system
+        .process(pid)
+        .and_then(|process| process.exe())
+        .map(|path| path.to_path_buf())
 }
 
 #[cfg(unix)]

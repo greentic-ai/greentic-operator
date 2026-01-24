@@ -42,6 +42,23 @@ Demo bundles
 greentic-operator demo build --out demo-bundle --tenant tenant1 --team team1
 greentic-operator demo up --bundle demo-bundle --tenant tenant1 --team team1
 
+## Domain auto-discovery
+
+Domains are enabled automatically when provider packs exist:
+
+- messaging: `providers/messaging/*.gtpack`
+- events: `providers/events/*.gtpack`
+
+You can override per-domain behavior in `greentic.yaml`:
+
+```yaml
+services:
+  messaging:
+    enabled: auto   # auto|true|false
+  events:
+    enabled: auto   # auto|true|false
+```
+
 ## Dev/demo dependency mode
 
 Dev/demo uses local path dependencies for greentic-* crates with `version = "0.4"` and

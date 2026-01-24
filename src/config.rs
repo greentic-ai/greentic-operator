@@ -12,6 +12,8 @@ pub struct OperatorConfig {
     #[serde(default)]
     pub dev: Option<DevSettings>,
     #[serde(default)]
+    pub services: Option<OperatorServicesConfig>,
+    #[serde(default)]
     pub binaries: BTreeMap<String, String>,
 }
 
@@ -19,6 +21,54 @@ pub struct OperatorConfig {
 pub struct RuntimeConfig {
     #[serde(default)]
     pub messaging_command: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainEnabledMode {
+    Auto,
+    True,
+    False,
+}
+
+impl Default for DomainEnabledMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl DomainEnabledMode {
+    pub fn is_enabled(self, has_providers: bool) -> bool {
+        match self {
+            Self::Auto => has_providers,
+            Self::True => true,
+            Self::False => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct OperatorServicesConfig {
+    #[serde(default)]
+    pub messaging: DomainServicesConfig,
+    #[serde(default)]
+    pub events: DomainServicesConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct DomainServicesConfig {
+    #[serde(default)]
+    pub enabled: DomainEnabledMode,
+    #[serde(default)]
+    pub components: Vec<ServiceComponentConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ServiceComponentConfig {
+    pub id: String,
+    pub binary: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +156,8 @@ pub struct DemoServicesConfig {
     pub egress: DemoEgressConfig,
     #[serde(default)]
     pub subscriptions: DemoSubscriptionsConfig,
+    #[serde(default)]
+    pub events: DemoEventsConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -152,6 +204,14 @@ pub struct DemoEgressConfig {
 pub struct DemoSubscriptionsConfig {
     #[serde(default)]
     pub msgraph: DemoMsgraphSubscriptionsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DemoEventsConfig {
+    #[serde(default)]
+    pub enabled: DomainEnabledMode,
+    #[serde(default = "default_events_components")]
+    pub components: Vec<ServiceComponentConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -223,6 +283,15 @@ impl Default for DemoMsgraphSubscriptionsConfig {
             binary: default_msgraph_binary(),
             mode: default_msgraph_mode(),
             args: Vec::new(),
+        }
+    }
+}
+
+impl Default for DemoEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DomainEnabledMode::Auto,
+            components: default_events_components(),
         }
     }
 }
@@ -299,4 +368,19 @@ fn default_msgraph_binary() -> String {
 
 fn default_msgraph_mode() -> String {
     "poll".to_string()
+}
+
+pub(crate) fn default_events_components() -> Vec<ServiceComponentConfig> {
+    vec![
+        ServiceComponentConfig {
+            id: "events-ingress".to_string(),
+            binary: "greentic-events-ingress".to_string(),
+            args: Vec::new(),
+        },
+        ServiceComponentConfig {
+            id: "events-worker".to_string(),
+            binary: "greentic-events-worker".to_string(),
+            args: Vec::new(),
+        },
+    ]
 }

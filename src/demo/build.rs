@@ -31,9 +31,8 @@ pub fn build_bundle(
     pack_command: Option<&Path>,
 ) -> anyhow::Result<()> {
     if options.run_doctor && std::env::var("GREENTIC_OPERATOR_SKIP_DOCTOR").is_err() {
-        let pack_command = pack_command.ok_or_else(|| {
-            anyhow::anyhow!("greentic-pack command is required for demo doctor")
-        })?;
+        let pack_command = pack_command
+            .ok_or_else(|| anyhow::anyhow!("greentic-pack command is required for demo doctor"))?;
         crate::doctor::run_doctor(
             project_root,
             crate::doctor::DoctorScope::All,

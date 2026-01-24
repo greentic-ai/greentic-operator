@@ -47,6 +47,7 @@ fn demo_build_writes_bundle_with_relative_paths() {
             team: None,
             allow_pack_dirs: true,
             only_used_providers: false,
+            run_doctor: false,
         },
         None,
     )

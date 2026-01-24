@@ -267,7 +267,13 @@ mod tests {
 
     #[test]
     fn build_init_args_with_team() {
-        let args = build_init_args("dev", "tenant1", Some("team1"), Path::new("pack.gtpack"));
+        let args = build_init_args(
+            "dev",
+            "tenant1",
+            Some("team1"),
+            Path::new("pack.gtpack"),
+            false,
+        );
         assert_eq!(
             args,
             vec![
@@ -287,7 +293,7 @@ mod tests {
 
     #[test]
     fn build_init_args_without_team() {
-        let args = build_init_args("dev", "tenant1", None, Path::new("pack.gtpack"));
+        let args = build_init_args("dev", "tenant1", None, Path::new("pack.gtpack"), false);
         assert_eq!(
             args,
             vec![

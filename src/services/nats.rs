@@ -56,10 +56,10 @@ fn container_name(root: &Path) -> String {
 }
 
 fn nats_port(root: &Path) -> u16 {
-    if let Ok(value) = std::env::var("GREENTIC_OPERATOR_NATS_PORT") {
-        if let Ok(port) = u16::from_str(&value) {
-            return port;
-        }
+    if let Ok(value) = std::env::var("GREENTIC_OPERATOR_NATS_PORT")
+        && let Ok(port) = u16::from_str(&value)
+    {
+        return port;
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut identity = root.to_path_buf();

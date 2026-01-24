@@ -31,6 +31,9 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         &request.flow_id,
     )?;
     std::fs::create_dir_all(&run_dir)?;
+    let input_path = run_dir.join("input.json");
+    let input_json = serde_json::to_string_pretty(&request.input)?;
+    std::fs::write(&input_path, input_json)?;
 
     let opts = RunOptions {
         entry_flow: Some(request.flow_id.clone()),

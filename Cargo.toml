@@ -1,7 +1,8 @@
 [package]
 name = "greentic-operator"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+rust-version = "1.90"
 description = "Greentic operator CLI for local dev and demo orchestration."
 license = "MIT"
 repository = "https://github.com/greentic/greentic-operator"

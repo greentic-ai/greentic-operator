@@ -133,14 +133,14 @@ fn load_manifest(path: &Path) -> anyhow::Result<ResolvedManifest> {
 fn messaging_adapter_packs(root: &Path, manifest: &ResolvedManifest) -> Vec<String> {
     let mut packs = Vec::new();
     let base = manifest_base(root, manifest);
-    if let Some(providers) = manifest.providers.as_ref() {
-        if let Some(adapter_packs) = providers.get("messaging") {
-            packs.extend(
-                adapter_packs
-                    .iter()
-                    .map(|pack| absolutize_pack_path(&base, pack)),
-            );
-        }
+    if let Some(providers) = manifest.providers.as_ref()
+        && let Some(adapter_packs) = providers.get("messaging")
+    {
+        packs.extend(
+            adapter_packs
+                .iter()
+                .map(|pack| absolutize_pack_path(&base, pack)),
+        );
     }
     packs.extend(
         manifest
@@ -152,9 +152,7 @@ fn messaging_adapter_packs(root: &Path, manifest: &ResolvedManifest) -> Vec<Stri
 }
 
 fn manifest_base(root: &Path, manifest: &ResolvedManifest) -> std::path::PathBuf {
-    let root = root
-        .canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     if let Some(project_root) = manifest.project_root.as_ref() {
         let project_root = Path::new(project_root);
         if project_root.is_absolute() {
