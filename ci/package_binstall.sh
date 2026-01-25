@@ -27,7 +27,7 @@ if [[ -z "$OUT_DIR" ]]; then
   exit 1
 fi
 
-HOST_TARGET="$(rustc -vV | rg "^host:" | awk '{print $2}')"
+HOST_TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
 if [[ -z "$TARGET" ]]; then
   TARGET="$HOST_TARGET"
 fi
