@@ -107,10 +107,22 @@ pub fn persist(root: &Path, tenant: &str, discovery: &DiscoveryResult) -> anyhow
 fn read_pack_id_from_manifest(path: &Path) -> anyhow::Result<Option<String>> {
     let file = std::fs::File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)?;
-    if let Some(parsed) = read_manifest_cbor_for_discovery(&mut archive)? {
+    if let Some(parsed) = read_manifest_cbor_for_discovery(&mut archive).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to decode manifest.cbor in {}: {err}",
+            path.display()
+        )
+    })? {
         return extract_pack_id(parsed);
     }
-    if let Some(parsed) = read_manifest_json_for_discovery(&mut archive, "pack.manifest.json")? {
+    if let Some(parsed) = read_manifest_json_for_discovery(&mut archive, "pack.manifest.json")
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "failed to decode pack.manifest.json in {}: {err}",
+                path.display()
+            )
+        })?
+    {
         return extract_pack_id(parsed);
     }
     Ok(None)
@@ -119,7 +131,12 @@ fn read_pack_id_from_manifest(path: &Path) -> anyhow::Result<Option<String>> {
 fn read_pack_id_from_manifest_cbor_only(path: &Path) -> anyhow::Result<Option<String>> {
     let file = std::fs::File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)?;
-    if let Some(parsed) = read_manifest_cbor_for_discovery(&mut archive)? {
+    if let Some(parsed) = read_manifest_cbor_for_discovery(&mut archive).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to decode manifest.cbor in {}: {err}",
+            path.display()
+        )
+    })? {
         return extract_pack_id(parsed);
     }
     Err(missing_cbor_error(path))
@@ -128,6 +145,9 @@ fn read_pack_id_from_manifest_cbor_only(path: &Path) -> anyhow::Result<Option<St
 fn extract_pack_id(parsed: domains::PackManifestForDiscovery) -> anyhow::Result<Option<String>> {
     if let Some(meta) = parsed.meta {
         return Ok(Some(meta.pack_id));
+    }
+    if let Some(pack_id) = parsed.pack_id {
+        return Ok(Some(pack_id));
     }
     Ok(None)
 }

@@ -117,6 +117,33 @@ fn discovery_ignores_name_only_manifest() {
 }
 
 #[test]
+fn discovery_reads_top_level_pack_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let messaging = root.join("providers").join("messaging");
+    std::fs::create_dir_all(&messaging).unwrap();
+
+    let path = messaging.join("top-level.gtpack");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::<()>::default();
+    zip.start_file("manifest.cbor", options).unwrap();
+    let manifest = serde_json::json!({
+        "pack_id": "top-level-pack"
+    });
+    let bytes = serde_cbor::to_vec(&manifest).unwrap();
+    std::io::Write::write_all(&mut zip, &bytes).unwrap();
+    zip.finish().unwrap();
+
+    let result =
+        discovery::discover_with_options(root, discovery::DiscoveryOptions { cbor_only: true })
+            .unwrap();
+    assert_eq!(result.providers.len(), 1);
+    assert_eq!(result.providers[0].provider_id, "top-level-pack");
+    assert_eq!(result.providers[0].id_source, ProviderIdSource::Manifest);
+}
+
+#[test]
 fn discovery_cbor_only_rejects_json_manifest() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
