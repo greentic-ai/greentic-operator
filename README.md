@@ -42,6 +42,11 @@ Demo bundles
 greentic-operator demo build --out demo-bundle --tenant tenant1 --team team1
 greentic-operator demo up --bundle demo-bundle --tenant tenant1 --team team1
 
+Demo send (generic)
+
+greentic-operator demo send --bundle demo-bundle --provider telegram --print-required-args
+greentic-operator demo send --bundle demo-bundle --provider telegram --text "hi" --arg chat_id=123
+
 ## Domain auto-discovery
 
 Domains are enabled automatically when provider packs exist:

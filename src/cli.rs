@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use serde_json::{Map as JsonMap, Value as JsonValue};
+
 use clap::{Parser, Subcommand, ValueEnum};
+use greentic_runner_desktop::RunStatus;
 
 use crate::bin_resolver::{self, ResolveCtx};
 use crate::config;
@@ -84,6 +87,7 @@ enum DemoSubcommand {
     Build(DemoBuildArgs),
     Up(DemoUpArgs),
     Setup(DemoSetupArgs),
+    Send(DemoSendArgs),
     Down(DemoDownArgs),
     Status(DemoStatusArgs),
     Logs(DemoLogsArgs),
@@ -646,6 +650,31 @@ struct DemoDoctorArgs {
     #[command(flatten)]
     dev: DevModeArgs,
 }
+
+#[derive(Parser)]
+#[command(
+    about = "Send a demo message via a provider pack.",
+    long_about = "Runs provider requirements or sends a generic message payload.",
+    after_help = "Main options:\n  --bundle <DIR>\n  --provider <PROVIDER>\n\nOptional options:\n  --text <TEXT>\n  --arg <k=v>...\n  --args-json <JSON>\n  --tenant <TENANT> (default: demo)\n  --team <TEAM> (default: default)\n  --print-required-args"
+)]
+struct DemoSendArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long)]
+    provider: String,
+    #[arg(long)]
+    text: Option<String>,
+    #[arg(long = "arg")]
+    args: Vec<String>,
+    #[arg(long)]
+    args_json: Option<String>,
+    #[arg(long, default_value = "demo")]
+    tenant: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+    #[arg(long)]
+    print_required_args: bool,
+}
 #[derive(Parser)]
 #[command(
     about = "Allow/forbid a gmap rule for tenant or team.",
@@ -764,6 +793,7 @@ impl DemoCommand {
             DemoSubcommand::Build(args) => args.run(ctx),
             DemoSubcommand::Up(args) => args.run(ctx),
             DemoSubcommand::Setup(args) => args.run(),
+            DemoSubcommand::Send(args) => args.run(),
             DemoSubcommand::Down(args) => args.run(),
             DemoSubcommand::Status(args) => args.run(),
             DemoSubcommand::Logs(args) => args.run(),
@@ -1402,6 +1432,99 @@ impl DemoSetupArgs {
         Ok(())
     }
 }
+
+impl DemoSendArgs {
+    fn run(self) -> anyhow::Result<()> {
+        let team = if self.team.is_empty() {
+            None
+        } else {
+            Some(self.team.as_str())
+        };
+        let pack = resolve_demo_provider_pack(
+            &self.bundle,
+            &self.tenant,
+            team,
+            &self.provider,
+            Domain::Messaging,
+        )?;
+        let discovery = discovery::discover(&self.bundle)?;
+        let provider_map = discovery_map(&discovery.providers);
+        let provider_id = provider_id_for_pack(&pack.path, &pack.pack_id, Some(&provider_map));
+
+        if self.print_required_args {
+            if let Err(message) = ensure_requirements_flow(&pack) {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+            let input = build_input_payload(&self.bundle, Domain::Messaging, &self.tenant, team);
+            let outcome = run_demo_flow(
+                &self.bundle,
+                Domain::Messaging,
+                &self.tenant,
+                team,
+                &pack,
+                "requirements",
+                &input,
+                None,
+            )?;
+            if !outcome.success {
+                let message = outcome
+                    .error
+                    .unwrap_or_else(|| "requirements flow failed".to_string());
+                return Err(anyhow::anyhow!(message));
+            }
+            if let Some(value) = outcome.output {
+                if let Some(rendered) = format_requirements_output(&value) {
+                    println!("{rendered}");
+                } else {
+                    let json = serde_json::to_string_pretty(&value)?;
+                    println!("{json}");
+                }
+            } else if let Some(raw) = outcome.raw {
+                println!("{raw}");
+            }
+            return Ok(());
+        }
+
+        let text = self
+            .text
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--text is required unless --print-required-args"))?;
+        let args = merge_args(self.args_json.as_deref(), &self.args)?;
+        let mut payload = serde_json::json!({
+            "tenant": self.tenant,
+            "provider": provider_id,
+            "text": text,
+            "args": JsonValue::Object(args),
+        });
+        if let Some(team) = team {
+            payload["team"] = JsonValue::String(team.to_string());
+        }
+
+        let outcome = run_demo_flow(
+            &self.bundle,
+            Domain::Messaging,
+            &self.tenant,
+            team,
+            &pack,
+            "send",
+            &payload,
+            None,
+        )?;
+        if outcome.success {
+            println!("ok");
+            if let Some(value) = outcome.output {
+                let json = serde_json::to_string_pretty(&value)?;
+                println!("{json}");
+            } else if let Some(raw) = outcome.raw {
+                println!("{raw}");
+            }
+            return Ok(());
+        }
+        let message = outcome.error.unwrap_or_else(|| "send failed".to_string());
+        Err(anyhow::anyhow!(message))
+    }
+}
 fn restart_name(target: &RestartTarget) -> String {
     match target {
         RestartTarget::All => "all",
@@ -1623,6 +1746,71 @@ fn demo_resolved_manifest_path(root: &Path, tenant: &str, team: Option<&str>) ->
         None => format!("{tenant}.yaml"),
     };
     root.join("resolved").join(filename)
+}
+
+fn discovery_map(
+    providers: &[discovery::DetectedProvider],
+) -> std::collections::BTreeMap<PathBuf, discovery::DetectedProvider> {
+    let mut map = std::collections::BTreeMap::new();
+    for provider in providers {
+        map.insert(provider.pack_path.clone(), provider.clone());
+    }
+    map
+}
+
+fn provider_filter_matches(pack: &domains::ProviderPack, filter: &str) -> bool {
+    let file_stem = pack
+        .file_name
+        .strip_suffix(".gtpack")
+        .unwrap_or(&pack.file_name);
+    pack.pack_id == filter
+        || pack.file_name == filter
+        || file_stem == filter
+        || pack.pack_id.contains(filter)
+        || pack.file_name.contains(filter)
+        || file_stem.contains(filter)
+}
+
+fn resolve_demo_provider_pack(
+    root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+    provider: &str,
+    domain: Domain,
+) -> anyhow::Result<domains::ProviderPack> {
+    let mut packs = domains::discover_provider_packs(root, domain)?;
+    let is_demo_bundle = root.join("greentic.demo.yaml").exists();
+    if is_demo_bundle && let Some(allowed) = demo_provider_files(root, tenant, team, domain)? {
+        packs.retain(|pack| allowed.contains(&pack.file_name));
+    }
+    packs.retain(|pack| provider_filter_matches(pack, provider));
+    if packs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No provider packs matched. Try --provider <pack_id>."
+        ));
+    }
+    packs.sort_by(|a, b| a.path.cmp(&b.path));
+    if packs.len() > 1 {
+        let names = packs
+            .iter()
+            .map(|pack| pack.file_name.clone())
+            .collect::<Vec<_>>();
+        return Err(anyhow::anyhow!(
+            "Multiple provider packs matched: {}. Use a more specific --provider.",
+            names.join(", ")
+        ));
+    }
+    Ok(packs.remove(0))
+}
+
+fn ensure_requirements_flow(pack: &domains::ProviderPack) -> Result<(), String> {
+    if pack.entry_flows.iter().any(|flow| flow == "requirements") {
+        return Ok(());
+    }
+    Err(
+        "requirements flow not found in provider pack; ask the provider pack to include an entry flow named 'requirements'."
+            .to_string(),
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -2238,6 +2426,212 @@ fn read_public_base_url(root: &Path, tenant: &str, team: Option<&str>) -> Option
     crate::cloudflared::parse_public_url(&contents)
 }
 
+fn parse_kv(input: &str) -> anyhow::Result<(String, JsonValue)> {
+    let mut parts = input.splitn(2, '=');
+    let key = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("expected key=value"))?;
+    let value = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("expected key=value"))?
+        .trim();
+    if value.eq_ignore_ascii_case("true") {
+        return Ok((key.to_string(), JsonValue::Bool(true)));
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return Ok((key.to_string(), JsonValue::Bool(false)));
+    }
+    if let Ok(int_value) = value.parse::<i64>() {
+        return Ok((key.to_string(), JsonValue::Number(int_value.into())));
+    }
+    Ok((key.to_string(), JsonValue::String(value.to_string())))
+}
+
+fn merge_args(
+    args_json: Option<&str>,
+    args: &[String],
+) -> anyhow::Result<JsonMap<String, JsonValue>> {
+    let mut merged = JsonMap::new();
+    if let Some(raw) = args_json {
+        let parsed: JsonValue = serde_json::from_str(raw)?;
+        let JsonValue::Object(map) = parsed else {
+            return Err(anyhow::anyhow!("--args-json must be a JSON object"));
+        };
+        merged.extend(map);
+    }
+    for item in args {
+        let (key, value) = parse_kv(item)?;
+        merged.insert(key, value);
+    }
+    Ok(merged)
+}
+
+fn format_requirements_output(value: &JsonValue) -> Option<String> {
+    let JsonValue::Object(map) = value else {
+        return None;
+    };
+    let has_keys = map.contains_key("required_args")
+        || map.contains_key("optional_args")
+        || map.contains_key("examples")
+        || map.contains_key("notes");
+    if !has_keys {
+        return None;
+    }
+    let mut output = String::new();
+    if let Some(required) = map.get("required_args").and_then(JsonValue::as_array) {
+        output.push_str("Required args:\n");
+        for item in required {
+            output.push_str("  - ");
+            output.push_str(&format_requirements_item(item));
+            output.push('\n');
+        }
+    }
+    if let Some(optional) = map.get("optional_args").and_then(JsonValue::as_array) {
+        output.push_str("Optional args:\n");
+        for item in optional {
+            output.push_str("  - ");
+            output.push_str(&format_requirements_item(item));
+            output.push('\n');
+        }
+    }
+    if let Some(examples) = map.get("examples").and_then(JsonValue::as_array) {
+        output.push_str("Examples:\n");
+        for item in examples {
+            let pretty = serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
+            if pretty.contains('\n') {
+                output.push_str("  -\n");
+                for line in pretty.lines() {
+                    output.push_str("    ");
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            } else {
+                output.push_str("  - ");
+                output.push_str(&pretty);
+                output.push('\n');
+            }
+        }
+    }
+    if let Some(notes) = map.get("notes").and_then(JsonValue::as_str) {
+        output.push_str("Notes:\n");
+        output.push_str(notes);
+        output.push('\n');
+    }
+    Some(output.trim_end().to_string())
+}
+
+fn format_requirements_item(value: &JsonValue) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+struct FlowOutcome {
+    success: bool,
+    output: Option<JsonValue>,
+    raw: Option<String>,
+    error: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_demo_flow(
+    root: &Path,
+    domain: Domain,
+    tenant: &str,
+    team: Option<&str>,
+    pack: &domains::ProviderPack,
+    flow_id: &str,
+    input: &JsonValue,
+    runner_binary: Option<&Path>,
+) -> anyhow::Result<FlowOutcome> {
+    let dist_offline = true;
+    if let Some(runner_binary) = runner_binary {
+        let run_dir = state_layout::run_dir(root, domain, &pack.pack_id, flow_id)?;
+        std::fs::create_dir_all(&run_dir)?;
+        let input_path = run_dir.join("input.json");
+        let input_json = serde_json::to_string_pretty(input)?;
+        std::fs::write(&input_path, input_json)?;
+
+        let runner_flavor = runner_integration::detect_runner_flavor(runner_binary);
+        let output = runner_integration::run_flow_with_options(
+            runner_binary,
+            &pack.path,
+            flow_id,
+            input,
+            runner_integration::RunFlowOptions {
+                dist_offline,
+                tenant: Some(tenant),
+                team,
+                artifacts_dir: Some(&run_dir),
+                runner_flavor,
+            },
+        )?;
+        write_runner_cli_artifacts(&run_dir, &output)?;
+        let mut parsed = output.parsed.clone();
+        if parsed.is_none() {
+            parsed = serde_json::from_str(&output.stdout).ok();
+        }
+        if parsed.is_none() {
+            parsed = read_transcript_outputs(&run_dir)?;
+        }
+        let error = summarize_runner_error(&output);
+        let raw = if output.stdout.trim().is_empty() {
+            None
+        } else {
+            Some(output.stdout.clone())
+        };
+        return Ok(FlowOutcome {
+            success: output.status.success(),
+            output: parsed,
+            raw,
+            error,
+        });
+    }
+
+    let output = runner_exec::run_provider_pack_flow(runner_exec::RunRequest {
+        root: root.to_path_buf(),
+        domain,
+        pack_path: pack.path.clone(),
+        pack_label: pack.pack_id.clone(),
+        flow_id: flow_id.to_string(),
+        tenant: tenant.to_string(),
+        team: team.map(|value| value.to_string()),
+        input: input.clone(),
+        dist_offline,
+    })?;
+    let parsed = read_transcript_outputs(&output.run_dir)?;
+    Ok(FlowOutcome {
+        success: output.result.status == RunStatus::Success,
+        output: parsed,
+        raw: None,
+        error: output.result.error.clone(),
+    })
+}
+
+fn read_transcript_outputs(run_dir: &Path) -> anyhow::Result<Option<JsonValue>> {
+    let path = run_dir.join("transcript.jsonl");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let mut last = None;
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
+        let Some(outputs) = value.get("outputs") else {
+            continue;
+        };
+        if !outputs.is_null() {
+            last = Some(outputs.clone());
+        }
+    }
+    Ok(last)
+}
+
 impl From<DomainArg> for Domain {
     fn from(value: DomainArg) -> Self {
         match value {
@@ -2245,5 +2639,66 @@ impl From<DomainArg> for Domain {
             DomainArg::Events => Domain::Events,
             DomainArg::Secrets => Domain::Secrets,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_kv_infers_basic_types() {
+        let (key, value) = parse_kv("a=1").unwrap();
+        assert_eq!(key, "a");
+        assert_eq!(value, JsonValue::Number(1.into()));
+
+        let (key, value) = parse_kv("b=true").unwrap();
+        assert_eq!(key, "b");
+        assert_eq!(value, JsonValue::Bool(true));
+
+        let (key, value) = parse_kv("c=hello").unwrap();
+        assert_eq!(key, "c");
+        assert_eq!(value, JsonValue::String("hello".to_string()));
+    }
+
+    #[test]
+    fn merge_args_overrides_json() {
+        let merged = merge_args(
+            Some(r#"{"chat_id":1,"mode":"x"}"#),
+            &["chat_id=2".to_string()],
+        )
+        .unwrap();
+        assert_eq!(merged.get("chat_id"), Some(&JsonValue::Number(2.into())));
+        assert_eq!(
+            merged.get("mode"),
+            Some(&JsonValue::String("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn requirements_formatting_structured() {
+        let value = serde_json::json!({
+            "required_args": ["chat_id"],
+            "optional_args": ["thread_id"],
+            "examples": [{"chat_id": 1}],
+            "notes": "Example note"
+        });
+        let rendered = format_requirements_output(&value).unwrap();
+        assert!(rendered.contains("Required args:"));
+        assert!(rendered.contains("Optional args:"));
+        assert!(rendered.contains("Examples:"));
+        assert!(rendered.contains("Notes:"));
+    }
+
+    #[test]
+    fn requirements_missing_message() {
+        let pack = domains::ProviderPack {
+            pack_id: "demo".to_string(),
+            file_name: "demo.gtpack".to_string(),
+            path: PathBuf::from("demo.gtpack"),
+            entry_flows: vec!["setup_default".to_string()],
+        };
+        let error = ensure_requirements_flow(&pack).unwrap_err();
+        assert!(error.contains("requirements flow not found"));
     }
 }

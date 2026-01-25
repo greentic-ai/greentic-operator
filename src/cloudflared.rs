@@ -123,9 +123,7 @@ fn find_url_in_text(contents: &str) -> Option<String> {
     while let Some(pos) = contents[offset..].find("https://") {
         let start = offset + pos;
         let tail = &contents[start..];
-        let end_offset = tail
-            .find(char::is_whitespace)
-            .unwrap_or_else(|| tail.len());
+        let end_offset = tail.find(char::is_whitespace).unwrap_or(tail.len());
         let mut candidate = &contents[start..start + end_offset];
         candidate = candidate.trim_end_matches(|ch: char| {
             matches!(ch, ')' | ',' | '|' | '"' | '\'' | ']' | '>' | '<')
