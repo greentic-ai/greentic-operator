@@ -43,6 +43,15 @@ greentic-operator demo build --out demo-bundle --tenant tenant1 --team team1
 greentic-operator demo up --bundle demo-bundle --tenant tenant1 --team team1
 Note: demo bundles require CBOR-only packs (`manifest.cbor`). Rebuild packs with `greentic-pack build` (avoid `--dev`).
 
+### allow/forbid commands
+
+There are two sets of gmap editing helpers:
+
+- `greentic-operator dev allow/forbid` edits the project under the current working directory. The `--path` argument uses the classic `PACK[/FLOW[/NODE]]` segments and applies the policy inside `tenants/<tenant>[/teams/<team>]/(tenant|team).gmap`, followed by `dev sync`.
+- `greentic-operator demo allow/forbid` is meant for portable bundles. Supply `--bundle <DIR>` plus `--tenant`/`--team` and pass the same `PACK[/FLOW[/NODE]]` path. The command rewrites the bundle’s gmap, reruns the resolver, and copies the updated `state/resolved/<tenant>[.<team>].yaml` into `resolved/`, so `demo up` immediately sees the change.
+
+Paths must contain at most three segments. Passing `PACK/FLOW/NODE/EXTRA` (or relative paths with more than three parts) will trigger the “too many segments” error you saw. Stick to the `pack`, `pack/flow`, or `pack/flow/node` forms.
+
 Demo send (generic)
 
 greentic-operator demo send --bundle demo-bundle --provider telegram --print-required-args
@@ -141,3 +150,22 @@ Run with:
 ```bash
 greentic-operator demo up --config ./demo/demo.yaml
 ```
+
+## Embedded GSM services (WIP)
+
+The operator now contains an `services::embedded` helper that runs `gsm-gateway`, `gsm-egress`, and
+`gsm-subscriptions-teams` inside the operator process using their existing async runtimes. This prevents the demo/dev
+workflow from requiring those binaries on `PATH` while we work on the complete integration.
+
+You can experiment with the new command:
+
+```bash
+greentic-operator dev embedded --project-root /projects/ai/greentic-ng/greentic-dev
+```
+
+It starts the gateway/egress/subscriptions services (plus optional NATS) and blocks until you stop it with `Ctrl+C`.
+The command honors `greentic.yaml` in the target project root and uses the same detection logic as `dev up`. Supply
+`--no-nats` if you already have a NATS instance running.
+
+`greentic-operator dev up` now runs the same embedded stack by default (including the gateway/egress/subscriptions
+ trio), so it keeps running until you press `Ctrl+C` and cleans up NATS and event components before exiting.

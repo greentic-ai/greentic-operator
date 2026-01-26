@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -7,6 +12,7 @@ use greentic_runner_desktop::RunStatus;
 
 use crate::bin_resolver::{self, ResolveCtx};
 use crate::config;
+use crate::demo::setup::{ProvidersInput, discover_tenants};
 use crate::demo::{self, BuildOptions};
 use crate::dev_mode::{
     DevCliOverrides, DevMode, DevProfile, DevSettingsResolved, effective_dev_settings,
@@ -18,7 +24,10 @@ use crate::gmap::{self, Policy};
 use crate::project::{self, ScanFormat};
 use crate::runner_exec;
 use crate::runner_integration;
+use crate::runtime_state::RuntimePaths;
+use crate::secrets_gate::{self, DynSecretsManager};
 use crate::settings;
+use crate::setup_input::{SetupInputAnswers, collect_setup_answers, load_setup_input};
 use crate::state_layout;
 
 mod dev_mode_cmd;
@@ -71,6 +80,7 @@ enum DevSubcommand {
     Allow(DevPolicyArgs),
     Forbid(DevPolicyArgs),
     Up(DevUpArgs),
+    Embedded(DevEmbeddedArgs),
     Down(DevDownArgs),
     #[command(name = "svc-status")]
     SvcStatus(DevStatusArgs),
@@ -92,6 +102,8 @@ enum DemoSubcommand {
     Status(DemoStatusArgs),
     Logs(DemoLogsArgs),
     Doctor(DemoDoctorArgs),
+    Allow(DemoPolicyArgs),
+    Forbid(DemoPolicyArgs),
 }
 
 #[derive(Parser)]
@@ -250,6 +262,19 @@ struct DevUpArgs {
     project_root: Option<PathBuf>,
     #[command(flatten)]
     dev: DevModeArgs,
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Run GSM gateway/egress/subscriptions in-process for local dev.",
+    long_about = "Hosts the GSM services inside the operator process and blocks until Ctrl+C.",
+    after_help = "Optional options:\n  --project-root <PATH> (default: current directory)\n  --no-nats"
+)]
+struct DevEmbeddedArgs {
+    #[arg(long)]
+    project_root: Option<PathBuf>,
+    #[arg(long)]
+    no_nats: bool,
 }
 
 #[derive(Parser)]
@@ -481,41 +506,123 @@ struct DemoBuildArgs {
 #[derive(Parser)]
 #[command(
     about = "Start demo services from a bundle.",
-    long_about = "Uses resolved manifests inside the bundle to start services and optional NATS.",
-    after_help = "Main options:\n  --bundle <DIR> (bundle mode)\n  --config <PATH> (config mode)\n\nOptional options:\n  --tenant <TENANT>\n  --team <TEAM>\n  --no-nats\n  --nats-url <URL>\n  --cloudflared <on|off> (default: on)\n  --cloudflared-binary <PATH>\n  --restart <all|cloudflared|nats|gateway|egress|subscriptions>[,...]\n  --providers <csv>\n  --skip-setup\n  --skip-secrets-init\n  --verify-webhooks\n  --force-setup\n  --setup-input <PATH>\n  --runner-binary <PATH>\n  --dev-mode <auto|on|off>\n  --dev-root <PATH>\n  --dev-profile <debug|release>\n  --dev-target-dir <PATH>"
+    long_about = "Uses resolved manifests inside the bundle to start services and optional NATS."
 )]
 struct DemoUpArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        help_heading = "Main options",
+        help = "Path to the bundle directory to run in bundle mode."
+    )]
     bundle: Option<PathBuf>,
-    #[arg(long)]
-    tenant: Option<String>,
-    #[arg(long)]
-    team: Option<String>,
-    #[arg(long)]
-    no_nats: bool,
-    #[arg(long)]
-    nats_url: Option<String>,
-    #[arg(long)]
-    config: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = CloudflaredModeArg::On)]
-    cloudflared: CloudflaredModeArg,
-    #[arg(long)]
-    cloudflared_binary: Option<PathBuf>,
-    #[arg(long, value_enum, value_delimiter = ',')]
-    restart: Vec<RestartTarget>,
-    #[arg(long, value_delimiter = ',')]
-    providers: Vec<String>,
-    #[arg(long)]
-    skip_setup: bool,
-    #[arg(long)]
-    skip_secrets_init: bool,
-    #[arg(long)]
-    verify_webhooks: bool,
-    #[arg(long)]
-    force_setup: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        default_value = "messaging",
+        help_heading = "Optional options",
+        help = "Domain(s) to operate on (messaging, events, secrets, all)."
+    )]
+    domain: DemoSetupDomainArg,
+    #[arg(
+        long,
+        help_heading = "Main options",
+        help = "JSON/YAML file describing provider setup inputs."
+    )]
     setup_input: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help_heading = "Main options",
+        help = "Optional override for the public base URL injected into every setup input."
+    )]
+    public_base_url: Option<String>,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Tenant to target when running the bundle (defaults to demo)."
+    )]
+    tenant: Option<String>,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Team to assign when running demo services."
+    )]
+    team: Option<String>,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Skip spawning local NATS (used when you already have one)."
+    )]
+    no_nats: bool,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "URL of an existing NATS server to use instead of spawning one."
+    )]
+    nats_url: Option<String>,
+    #[arg(
+        long,
+        default_value = "demo",
+        help_heading = "Optional options",
+        help = "Environment used for secrets lookups."
+    )]
+    env: String,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Path to a prebuilt config file to use instead of auto-discovery."
+    )]
+    config: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = CloudflaredModeArg::On, help_heading = "Optional options", help = "Whether to start cloudflared for webhook tunneling.")]
+    cloudflared: CloudflaredModeArg,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Explicit path to the cloudflared binary used when cloudflared mode is on."
+    )]
+    cloudflared_binary: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        help_heading = "Optional options",
+        help = "Comma-separated list of services to restart before running demo (e.g. gateway)."
+    )]
+    restart: Vec<RestartTarget>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help_heading = "Optional options",
+        help = "CSV list of provider pack IDs to restrict setup to."
+    )]
+    providers: Vec<String>,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Avoid running provider setup flows."
+    )]
+    skip_setup: bool,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Skip greentic-secrets init during setup."
+    )]
+    skip_secrets_init: bool,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Run webhook verification flows after setup completes."
+    )]
+    verify_webhooks: bool,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Force re-run of setup flows even if records already exist."
+    )]
+    force_setup: bool,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Path to a greentic-runner binary override."
+    )]
     runner_binary: Option<PathBuf>,
     #[command(flatten)]
     dev: DevModeArgs,
@@ -529,11 +636,36 @@ enum DemoSetupDomainArg {
     All,
 }
 
+impl DemoSetupDomainArg {
+    fn resolve_domains(self, discovery: Option<&discovery::DiscoveryResult>) -> Vec<Domain> {
+        match self {
+            DemoSetupDomainArg::Messaging => vec![Domain::Messaging],
+            DemoSetupDomainArg::Events => vec![Domain::Events],
+            DemoSetupDomainArg::Secrets => vec![Domain::Secrets],
+            DemoSetupDomainArg::All => {
+                let mut enabled = Vec::new();
+                let has_messaging = discovery
+                    .map(|value| value.domains.messaging)
+                    .unwrap_or(true);
+                let has_events = discovery.map(|value| value.domains.events).unwrap_or(true);
+                if has_messaging {
+                    enabled.push(Domain::Messaging);
+                }
+                if has_events {
+                    enabled.push(Domain::Events);
+                }
+                enabled.push(Domain::Secrets);
+                enabled
+            }
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     about = "Run provider setup flows against a demo bundle.",
     long_about = "Executes setup flows for provider packs included in the bundle.",
-    after_help = "Main options:\n  --bundle <DIR>\n  --tenant <TENANT>\n\nOptional options:\n  --team <TEAM>\n  --domain <messaging|events|secrets|all> (default: all)\n  --provider <FILTER>\n  --dry-run\n  --format <text|json|yaml> (default: text)\n  --parallel <N> (default: 1)\n  --allow-missing-setup\n  --online\n  --secrets-env <ENV>\n  --secrets-bin <PATH>\n  --skip-secrets-init\n  --runner-binary <PATH>\n  --best-effort"
+    after_help = "Main options:\n  --bundle <DIR>\n  --tenant <TENANT>\n\nOptional options:\n  --team <TEAM>\n  --domain <messaging|events|secrets|all> (default: all)\n  --provider <FILTER>\n  --dry-run\n  --format <text|json|yaml> (default: text)\n  --parallel <N> (default: 1)\n  --allow-missing-setup\n  --online\n  --secrets-env <ENV>\n  --secrets-bin <PATH>\n  --skip-secrets-init\n  --setup-input <PATH>\n  --runner-binary <PATH>\n  --best-effort"
 )]
 struct DemoSetupArgs {
     #[arg(long)]
@@ -567,7 +699,26 @@ struct DemoSetupArgs {
     #[arg(long)]
     runner_binary: Option<PathBuf>,
     #[arg(long)]
+    setup_input: Option<PathBuf>,
+    #[arg(long)]
     best_effort: bool,
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Allow/forbid a gmap rule inside a demo bundle.",
+    long_about = "Updates the demo bundle's gmap, reruns the resolver, and copies the updated manifest so demo up sees the change immediately.",
+    after_help = "Main options:\n  --bundle <DIR>\n  --tenant <TENANT>\n  --path <PACK[/FLOW[/NODE]] (up to 3 segments)\n\nOptional options:\n  --team <TEAM>\n\nPaths use the same PACK[/FLOW[/NODE]] syntax as the dev allow/forbid commands (max 3 segments). The command modifies tenants/<tenant>[/teams/<team>]/(tenant|team).gmap, resolves state/resolved/<tenant>[.<team>].yaml, and overwrites resolved/<tenant>[.<team>].yaml so demo up picks it up without a rebuild."
+)]
+struct DemoPolicyArgs {
+    #[arg(long, help = "Path to the demo bundle directory.")]
+    bundle: PathBuf,
+    #[arg(long, help = "Tenant owning the gmap rule.")]
+    tenant: String,
+    #[arg(long, help = "Team owning the gmap rule.")]
+    team: Option<String>,
+    #[arg(long, help = "Gmap path to allow or forbid.")]
+    path: String,
 }
 #[derive(Parser)]
 #[command(
@@ -770,6 +921,7 @@ impl DevCommand {
             DevSubcommand::Allow(args) => args.run(Policy::Public),
             DevSubcommand::Forbid(args) => args.run(Policy::Forbidden),
             DevSubcommand::Up(args) => args.run(ctx),
+            DevSubcommand::Embedded(args) => args.run(ctx),
             DevSubcommand::Down(args) => args.run(),
             DevSubcommand::SvcStatus(args) => args.run(),
             DevSubcommand::Logs(args) => args.run(),
@@ -798,6 +950,8 @@ impl DemoCommand {
             DemoSubcommand::Status(args) => args.run(),
             DemoSubcommand::Logs(args) => args.run(),
             DemoSubcommand::Doctor(args) => args.run(ctx),
+            DemoSubcommand::Allow(args) => args.run(Policy::Public),
+            DemoSubcommand::Forbid(args) => args.run(Policy::Forbidden),
         }
     }
 }
@@ -930,46 +1084,69 @@ impl DevUpArgs {
         let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
 
         let mut nats_url = self.nats_url.clone();
+        let mut nats_started = false;
         if !self.no_nats && nats_url.is_none() && (messaging_enabled || events_enabled) {
             if let Err(err) = crate::services::start_nats(&root) {
                 eprintln!("Warning: failed to start NATS: {err}");
             } else {
                 nats_url = Some(crate::services::nats_url(&root));
+                nats_started = true;
             }
         }
 
-        if messaging_enabled {
-            let messaging_binary = config::messaging_binary(config.as_ref(), &root);
-            let command = bin_resolver::resolve_binary(
-                &messaging_binary.name,
-                &ResolveCtx {
-                    config_dir: root.clone(),
-                    dev: dev_settings.clone(),
-                    explicit_path: messaging_binary.explicit_path,
-                },
-            )?;
-            let state = crate::services::start_messaging_with_command(
-                &root,
-                &self.tenant,
-                self.team.as_deref(),
-                nats_url.as_deref(),
-                &command.to_string_lossy(),
-            )?;
-            println!("messaging: {:?}", state);
-        } else {
-            println!("messaging: skipped (disabled or no providers)");
-        }
-
+        let mut event_specs = Vec::new();
         if events_enabled {
             let envs = build_domain_env(&self.tenant, self.team.as_deref(), nats_url.as_deref());
             for spec in resolve_event_components(&root, config.as_ref(), &services, &dev_settings)?
             {
                 let state = crate::services::start_component(&root, &spec, &envs)?;
                 println!("{}: {:?}", spec.id, state);
+                event_specs.push(spec);
             }
         } else {
             println!("events: skipped (disabled or no providers)");
         }
+
+        if messaging_enabled {
+            crate::services::run_services(&root)?;
+        } else {
+            println!("messaging: skipped (disabled or no providers)");
+        }
+
+        for spec in event_specs {
+            let id = spec.id.clone();
+            let state = crate::services::stop_component(&root, &id)?;
+            println!("{id}: {:?}", state);
+        }
+
+        if nats_started {
+            let nats = crate::services::stop_nats(&root)?;
+            println!("nats: {:?}", nats);
+        }
+
+        Ok(())
+    }
+}
+
+impl DevEmbeddedArgs {
+    fn run(self, _ctx: &AppCtx) -> anyhow::Result<()> {
+        let root = project_root(self.project_root)?;
+        let mut nats_started = false;
+        if !self.no_nats {
+            if let Err(err) = crate::services::start_nats(&root) {
+                eprintln!("Warning: failed to start NATS: {err}");
+            } else {
+                nats_started = true;
+            }
+        }
+
+        crate::services::run_services(&root)?;
+
+        if nats_started {
+            let nats = crate::services::stop_nats(&root)?;
+            println!("nats: {:?}", nats);
+        }
+
         Ok(())
     }
 }
@@ -982,8 +1159,9 @@ impl DevDownArgs {
             .as_ref()
             .and_then(|config| config.services.clone())
             .unwrap_or_default();
-        let state = crate::services::stop_messaging(&root, &self.tenant, self.team.as_deref())?;
-        println!("messaging: {:?}", state);
+        println!(
+            "messaging: embedded (starts/stops with `dev up`/`dev embedded`; Ctrl+C in those commands to exit)"
+        );
 
         for id in event_component_ids(&services) {
             let state = crate::services::stop_component(&root, &id)?;
@@ -1025,9 +1203,9 @@ impl DevStatusArgs {
         let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
 
         if messaging_enabled {
-            let messaging =
-                crate::services::messaging_status(&root, &self.tenant, self.team.as_deref())?;
-            println!("messaging: {:?}", messaging);
+            println!(
+                "messaging: embedded (starts/stops with `dev up`/`dev embedded`; Ctrl+C to exit)"
+            );
         } else {
             println!("messaging: skipped (disabled or no providers)");
         }
@@ -1054,7 +1232,10 @@ impl DevLogsArgs {
         let root = project_root(self.project_root)?;
         match self.service.unwrap_or(LogService::Messaging) {
             LogService::Messaging => {
-                crate::services::tail_messaging_logs(&root, &self.tenant, self.team.as_deref())
+                println!(
+                    "messaging: logs are streamed to this process while `dev up`/`dev embedded` run; rerun those commands to see output."
+                );
+                Ok(())
             }
             LogService::Nats => crate::services::tail_nats_logs(&root),
         }
@@ -1081,6 +1262,11 @@ impl DomainSetupArgs {
             secrets_bin: self.secrets_bin,
             runner_binary: None,
             best_effort: false,
+            setup_input: None,
+            allowed_providers: None,
+            preloaded_setup_answers: None,
+            public_base_url: None,
+            secrets_manager: None,
             discovered_providers: None,
         })
     }
@@ -1106,6 +1292,11 @@ impl DomainDiagnosticsArgs {
             secrets_bin: None,
             runner_binary: None,
             best_effort: false,
+            setup_input: None,
+            allowed_providers: None,
+            preloaded_setup_answers: None,
+            public_base_url: None,
+            secrets_manager: None,
             discovered_providers: None,
         })
     }
@@ -1131,6 +1322,11 @@ impl DomainVerifyArgs {
             secrets_bin: None,
             runner_binary: None,
             best_effort: false,
+            setup_input: None,
+            allowed_providers: None,
+            preloaded_setup_answers: None,
+            public_base_url: None,
+            secrets_manager: None,
             discovered_providers: None,
         })
     }
@@ -1228,7 +1424,7 @@ impl DemoUpArgs {
                     self.cloudflared
                 );
             }
-            let tenant = self.tenant.unwrap_or_else(|| "demo".to_string());
+            let tenant = self.tenant.clone().unwrap_or_else(|| "demo".to_string());
             let config = config::load_operator_config(&bundle)?;
             let dev_settings =
                 resolve_dev_settings(&ctx.settings, config.as_ref(), &self.dev, &bundle)?;
@@ -1247,26 +1443,14 @@ impl DemoUpArgs {
                 .enabled
                 .is_enabled(discovery.domains.messaging);
             let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
-            let messaging_command = if messaging_enabled {
-                let messaging_binary = config::messaging_binary(config.as_ref(), &bundle);
-                let command = bin_resolver::resolve_binary(
-                    &messaging_binary.name,
-                    &ResolveCtx {
-                        config_dir: bundle.clone(),
-                        dev: dev_settings.clone(),
-                        explicit_path: messaging_binary.explicit_path,
-                    },
-                )?;
-                Some(command.to_string_lossy().to_string())
-            } else {
-                None
-            };
             let events_components = if events_enabled {
                 resolve_event_components(&bundle, config.as_ref(), &services, &dev_settings)?
             } else {
                 Vec::new()
             };
-            let cloudflared = match self.cloudflared {
+            let domains_to_setup = self.domain.resolve_domains(Some(&discovery));
+
+            let mut cloudflared_config = match self.cloudflared {
                 CloudflaredModeArg::Off => None,
                 CloudflaredModeArg::On => {
                     let explicit = self.cloudflared_binary.clone();
@@ -1287,14 +1471,56 @@ impl DemoUpArgs {
                 }
             };
 
+            let mut public_base_url = self.public_base_url.clone();
+            let team_id = self.team.clone().unwrap_or_else(|| "default".to_string());
+            let mut started_cloudflared_early = false;
+            if public_base_url.is_none() && self.setup_input.is_some() {
+                if let Some(cfg) = cloudflared_config.as_mut() {
+                    let paths = RuntimePaths::new(&bundle.join("state"), &tenant, &team_id);
+                    let handle = crate::cloudflared::start_quick_tunnel(&paths, cfg)?;
+                    let domain_labels = domains_to_setup
+                        .iter()
+                        .map(|domain| domains::domain_name(*domain))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    println!(
+                        "Public URL (cloudflared setup domains={domain_labels}): {}",
+                        handle.url
+                    );
+                    public_base_url = Some(handle.url.clone());
+                    started_cloudflared_early = true;
+                }
+            }
+
+            if started_cloudflared_early {
+                if let Some(cfg) = cloudflared_config.as_mut() {
+                    cfg.restart = false;
+                }
+            }
+
+            if let Some(setup_input) = self.setup_input.as_ref() {
+                let secrets_manager = secrets_gate::default_manager();
+                run_demo_up_setup(
+                    &bundle,
+                    &domains_to_setup,
+                    setup_input,
+                    self.tenant.clone(),
+                    self.team.clone(),
+                    &self.env,
+                    self.runner_binary.clone(),
+                    public_base_url.clone(),
+                    Some(secrets_manager),
+                )?;
+            }
+
             return demo::demo_up(
                 &bundle,
                 &tenant,
                 self.team.as_deref(),
                 self.nats_url.as_deref(),
                 self.no_nats,
-                messaging_command.as_deref(),
-                cloudflared,
+                messaging_enabled,
+                cloudflared_config,
                 events_components,
             );
         }
@@ -1363,22 +1589,7 @@ impl DemoSetupArgs {
             discovery::DiscoveryOptions { cbor_only: true },
         )?;
         discovery::persist(&self.bundle, &self.tenant, &discovery)?;
-        let domains: Vec<Domain> = match self.domain {
-            DemoSetupDomainArg::Messaging => vec![Domain::Messaging],
-            DemoSetupDomainArg::Events => vec![Domain::Events],
-            DemoSetupDomainArg::Secrets => vec![Domain::Secrets],
-            DemoSetupDomainArg::All => {
-                let mut enabled = Vec::new();
-                if discovery.domains.messaging {
-                    enabled.push(Domain::Messaging);
-                }
-                if discovery.domains.events {
-                    enabled.push(Domain::Events);
-                }
-                enabled.push(Domain::Secrets);
-                enabled
-            }
-        };
+        let domains = self.domain.resolve_domains(Some(&discovery));
         if demo_debug_enabled() {
             println!(
                 "[demo] setup bundle={} tenant={} team={:?} domains={:?} provider_filter={:?} dry_run={} parallel={} skip_secrets_init={}",
@@ -1434,9 +1645,24 @@ impl DemoSetupArgs {
                 },
                 runner_binary: self.runner_binary.clone(),
                 best_effort: self.best_effort,
+                setup_input: self.setup_input.clone(),
+                allowed_providers: None,
+                preloaded_setup_answers: None,
+                public_base_url: None,
+                secrets_manager: None,
                 discovered_providers,
             })?;
         }
+        Ok(())
+    }
+}
+
+impl DemoPolicyArgs {
+    fn run(self, policy: Policy) -> anyhow::Result<()> {
+        let gmap_path = demo_bundle_gmap_path(&self.bundle, &self.tenant, self.team.as_deref());
+        gmap::upsert_policy(&gmap_path, &self.path, policy)?;
+        project::sync_project(&self.bundle)?;
+        copy_resolved_manifest(&self.bundle, &self.tenant, self.team.as_deref())?;
         Ok(())
     }
 }
@@ -1468,7 +1694,17 @@ impl DemoSendArgs {
                 eprintln!("{message}");
                 std::process::exit(2);
             }
-            let input = build_input_payload(&self.bundle, Domain::Messaging, &self.tenant, team);
+            let env = crate::tools::secrets::resolve_env();
+            let input = build_input_payload(
+                &self.bundle,
+                Domain::Messaging,
+                &self.tenant,
+                team,
+                Some(&pack.pack_id),
+                None,
+                None,
+                &env,
+            );
             let outcome = run_demo_flow(
                 &self.bundle,
                 Domain::Messaging,
@@ -1569,21 +1805,6 @@ fn resolve_demo_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf
 
 impl DemoDownArgs {
     fn run(self) -> anyhow::Result<()> {
-        if let Some(bundle) = self.bundle.as_ref()
-            && self.state_dir.is_none()
-        {
-            if demo_debug_enabled() {
-                println!(
-                    "[demo] down bundle={} tenant={} team={} no_nats={}",
-                    bundle.display(),
-                    self.tenant,
-                    self.team,
-                    self.no_nats
-                );
-            }
-            return demo::demo_down_legacy(bundle, &self.tenant, Some(&self.team), self.no_nats);
-        }
-
         let state_dir = resolve_state_dir(self.state_dir, self.bundle.as_ref());
         if demo_debug_enabled() {
             println!(
@@ -1600,22 +1821,6 @@ impl DemoDownArgs {
 
 impl DemoStatusArgs {
     fn run(self) -> anyhow::Result<()> {
-        if let Some(bundle) = self.bundle.as_ref()
-            && self.state_dir.is_none()
-        {
-            if demo_debug_enabled() {
-                println!(
-                    "[demo] status bundle={} tenant={} team={} no_nats={} verbose={}",
-                    bundle.display(),
-                    self.tenant,
-                    self.team,
-                    self.no_nats,
-                    self.verbose
-                );
-            }
-            return demo::demo_status_legacy(bundle, &self.tenant, Some(&self.team), self.no_nats);
-        }
-
         let state_dir = resolve_state_dir(self.state_dir, self.bundle.as_ref());
         if demo_debug_enabled() {
             println!(
@@ -1632,27 +1837,6 @@ impl DemoStatusArgs {
 
 impl DemoLogsArgs {
     fn run(self) -> anyhow::Result<()> {
-        if let Some(bundle) = self.bundle.as_ref()
-            && self.state_dir.is_none()
-        {
-            if demo_debug_enabled() {
-                println!(
-                    "[demo] logs bundle={} tenant={} team={} service={} tail={}",
-                    bundle.display(),
-                    self.tenant,
-                    self.team,
-                    self.service,
-                    self.tail
-                );
-            }
-            return demo::demo_logs_legacy(
-                bundle,
-                &self.tenant,
-                Some(&self.team),
-                Some(self.service.as_str()),
-            );
-        }
-
         let state_dir = resolve_state_dir(self.state_dir, self.bundle.as_ref());
         if demo_debug_enabled() {
             println!(
@@ -1703,7 +1887,7 @@ impl DemoDoctorArgs {
 }
 
 fn project_root(arg: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    Ok(arg.unwrap_or(std::env::current_dir()?))
+    Ok(arg.unwrap_or(env::current_dir()?))
 }
 
 fn resolve_state_dir(state_dir: Option<PathBuf>, bundle: Option<&PathBuf>) -> PathBuf {
@@ -1721,6 +1905,79 @@ fn demo_debug_enabled() -> bool {
         std::env::var("GREENTIC_OPERATOR_DEMO_DEBUG").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
     )
+}
+
+fn run_demo_up_setup(
+    bundle: &Path,
+    domains: &[Domain],
+    setup_input: &Path,
+    tenant_override: Option<String>,
+    team_override: Option<String>,
+    env: &str,
+    runner_binary: Option<PathBuf>,
+    public_base_url: Option<String>,
+    secrets_manager: Option<DynSecretsManager>,
+) -> anyhow::Result<()> {
+    let providers_input = ProvidersInput::load(setup_input)?;
+    for domain in domains {
+        let provider_map = match providers_input.providers_for_domain(*domain) {
+            Some(map) if !map.is_empty() => map,
+            _ => {
+                println!(
+                    "[demo] no providers configured for domain {}; skipping provider setup",
+                    domains::domain_name(*domain)
+                );
+                continue;
+            }
+        };
+        let tenants = if let Some(tenant) = tenant_override.as_ref() {
+            vec![tenant.clone()]
+        } else {
+            let discovered = discover_tenants(bundle, *domain)?;
+            if discovered.is_empty() {
+                println!(
+                    "[demo] no tenants discovered for domain {}; skipping",
+                    domains::domain_name(*domain)
+                );
+                continue;
+            }
+            discovered
+        };
+        let provider_keys: BTreeSet<String> = provider_map.keys().cloned().collect();
+        let mut map = serde_json::Map::new();
+        for (provider, value) in provider_map {
+            map.insert(provider.clone(), value.clone());
+        }
+        let setup_answers =
+            SetupInputAnswers::new(serde_json::Value::Object(map), provider_keys.clone())?;
+        for tenant in tenants {
+            run_domain_command(DomainRunArgs {
+                root: bundle.to_path_buf(),
+                state_root: None,
+                domain: *domain,
+                action: DomainAction::Setup,
+                tenant,
+                team: team_override.clone(),
+                provider_filter: None,
+                dry_run: false,
+                format: PlanFormat::Text,
+                parallel: 1,
+                allow_missing_setup: true,
+                online: false,
+                secrets_env: Some(env.to_string()),
+                secrets_bin: None,
+                runner_binary: runner_binary.clone(),
+                best_effort: false,
+                discovered_providers: None,
+                setup_input: None,
+                allowed_providers: Some(provider_keys.clone()),
+                preloaded_setup_answers: Some(setup_answers.clone()),
+                public_base_url: public_base_url.clone(),
+                secrets_manager: secrets_manager.clone(),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn demo_provider_files(
@@ -1753,11 +2010,47 @@ fn demo_provider_files(
 }
 
 fn demo_resolved_manifest_path(root: &Path, tenant: &str, team: Option<&str>) -> PathBuf {
-    let filename = match team {
+    root.join("resolved")
+        .join(resolved_manifest_filename(tenant, team))
+}
+
+fn demo_state_resolved_manifest_path(root: &Path, tenant: &str, team: Option<&str>) -> PathBuf {
+    root.join("state")
+        .join("resolved")
+        .join(resolved_manifest_filename(tenant, team))
+}
+
+fn resolved_manifest_filename(tenant: &str, team: Option<&str>) -> String {
+    match team {
         Some(team) => format!("{tenant}.{team}.yaml"),
         None => format!("{tenant}.yaml"),
-    };
-    root.join("resolved").join(filename)
+    }
+}
+
+fn demo_bundle_gmap_path(bundle: &Path, tenant: &str, team: Option<&str>) -> PathBuf {
+    let mut path = bundle.join("tenants").join(tenant);
+    if let Some(team) = team {
+        path = path.join("teams").join(team).join("team.gmap");
+    } else {
+        path = path.join("tenant.gmap");
+    }
+    path
+}
+
+fn copy_resolved_manifest(bundle: &Path, tenant: &str, team: Option<&str>) -> anyhow::Result<()> {
+    let src = demo_state_resolved_manifest_path(bundle, tenant, team);
+    if !src.exists() {
+        return Err(anyhow::anyhow!(
+            "resolved manifest not found at {}",
+            src.display()
+        ));
+    }
+    let dst = demo_resolved_manifest_path(bundle, tenant, team);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    Ok(())
 }
 
 fn discovery_map(
@@ -1894,6 +2187,11 @@ struct DomainRunArgs {
     runner_binary: Option<PathBuf>,
     best_effort: bool,
     discovered_providers: Option<Vec<discovery::DetectedProvider>>,
+    setup_input: Option<PathBuf>,
+    allowed_providers: Option<BTreeSet<String>>,
+    preloaded_setup_answers: Option<SetupInputAnswers>,
+    public_base_url: Option<String>,
+    secrets_manager: Option<DynSecretsManager>,
 }
 
 fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
@@ -1945,6 +2243,29 @@ fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
     if packs.is_empty() {
         return Ok(());
     }
+    if let Some(allowed) = args.allowed_providers.as_ref() {
+        let missing = filter_packs_by_allowed(&mut packs, allowed);
+        if !missing.is_empty() {
+            println!(
+                "[warn] skip setup domain={} missing packs: {}",
+                domains::domain_name(args.domain),
+                missing.join(", ")
+            );
+        }
+    }
+    let setup_answers = if let Some(preloaded) = args.preloaded_setup_answers.clone() {
+        Some(preloaded)
+    } else if let Some(path) = args.setup_input.as_ref() {
+        let provider_keys: BTreeSet<String> =
+            packs.iter().map(|pack| pack.pack_id.clone()).collect();
+        Some(SetupInputAnswers::new(
+            load_setup_input(path)?,
+            provider_keys,
+        )?)
+    } else {
+        None
+    };
+    let interactive = args.setup_input.is_none();
     let plan = domains::plan_runs(
         args.domain,
         args.action,
@@ -1985,7 +2306,31 @@ fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
         runner_binary,
         args.best_effort,
         provider_map,
+        setup_answers,
+        interactive,
+        args.public_base_url.clone(),
+        args.secrets_manager.clone(),
     )
+}
+
+fn filter_packs_by_allowed(
+    packs: &mut Vec<domains::ProviderPack>,
+    allowed: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    packs.retain(|pack| {
+        if allowed.contains(&pack.pack_id) {
+            seen.insert(pack.pack_id.clone());
+            true
+        } else {
+            false
+        }
+    });
+    allowed
+        .iter()
+        .filter(|value| !seen.contains(*value))
+        .cloned()
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2004,7 +2349,14 @@ fn run_plan(
     runner_binary: Option<PathBuf>,
     best_effort: bool,
     provider_map: Option<std::collections::BTreeMap<PathBuf, discovery::DetectedProvider>>,
+    setup_answers: Option<SetupInputAnswers>,
+    interactive: bool,
+    public_base_url: Option<String>,
+    secrets_manager: Option<DynSecretsManager>,
 ) -> anyhow::Result<()> {
+    let setup_answers = setup_answers.map(Arc::new);
+    let plan_public_base_url = public_base_url.map(Arc::new);
+    let plan_secrets_manager = secrets_manager;
     if parallel <= 1 {
         let mut errors = Vec::new();
         for item in plan {
@@ -2020,7 +2372,11 @@ fn run_plan(
                 secrets_env,
                 secrets_bin,
                 runner_binary.as_deref(),
+                setup_answers.as_deref(),
                 provider_map.as_ref(),
+                interactive,
+                plan_public_base_url.clone(),
+                plan_secrets_manager.clone(),
             );
             if let Err(err) = result {
                 if best_effort {
@@ -2052,6 +2408,10 @@ fn run_plan(
         let secrets_bin = secrets_bin.map(|value| value.to_path_buf());
         let runner_binary = runner_binary.clone();
         let provider_map = provider_map.clone();
+        let setup_answers = setup_answers.clone();
+        let interactive_flag = interactive;
+        let thread_public_base_url = plan_public_base_url.clone();
+        let thread_secrets_manager = plan_secrets_manager.clone();
         handles.push(std::thread::spawn(move || {
             loop {
                 let next = {
@@ -2073,7 +2433,11 @@ fn run_plan(
                     secrets_env.as_deref(),
                     secrets_bin.as_deref(),
                     runner_binary.as_deref(),
+                    setup_answers.as_deref(),
                     provider_map.as_ref(),
+                    interactive_flag,
+                    thread_public_base_url.clone(),
+                    thread_secrets_manager.clone(),
                 );
                 if let Err(err) = result {
                     errors.lock().unwrap().push(err);
@@ -2132,9 +2496,77 @@ fn run_plan_item(
     secrets_env: Option<&str>,
     secrets_bin: Option<&Path>,
     runner_binary: Option<&Path>,
+    setup_answers: Option<&SetupInputAnswers>,
     provider_map: Option<&std::collections::BTreeMap<PathBuf, discovery::DetectedProvider>>,
+    interactive: bool,
+    public_base_url: Option<Arc<String>>,
+    secrets_manager: Option<DynSecretsManager>,
 ) -> anyhow::Result<()> {
-    let input = build_input_payload(state_root, domain, tenant, team);
+    let provider_id = provider_id_for_pack(&item.pack.path, &item.pack.pack_id, provider_map);
+    let env_value = secrets_env
+        .map(|value| value.to_string())
+        .unwrap_or_else(crate::tools::secrets::resolve_env);
+
+    if domain == Domain::Messaging && action == DomainAction::Setup {
+        if let Some(manager) = secrets_manager.as_ref() {
+            match secrets_gate::check_provider_secrets(
+                manager,
+                &env_value,
+                tenant,
+                team,
+                &item.pack.path,
+                &provider_id,
+            ) {
+                Ok(Some(missing)) => {
+                    let formatted = missing
+                        .iter()
+                        .map(|entry| format!("  - {entry}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    println!(
+                        "[warn] skip setup domain={} tenant={} provider={}: missing secrets:\n{formatted}",
+                        domains::domain_name(domain),
+                        tenant,
+                        provider_id
+                    );
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    println!(
+                        "[warn] skip setup domain={} tenant={} provider={}: secrets check failed: {err}",
+                        domains::domain_name(domain),
+                        tenant,
+                        provider_id
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let setup_values = if action == DomainAction::Setup {
+        Some(collect_setup_answers(
+            &item.pack.path,
+            &item.pack.pack_id,
+            setup_answers,
+            interactive,
+        )?)
+    } else {
+        None
+    };
+
+    let public_base_url_ref = public_base_url.as_deref().map(|value| value.as_str());
+    let input = build_input_payload(
+        state_root,
+        domain,
+        tenant,
+        team,
+        Some(&item.pack.pack_id),
+        setup_values.as_ref(),
+        public_base_url_ref,
+        &env_value,
+    );
     if demo_debug_enabled() {
         println!(
             "[demo] setup input pack={} flow={} input={}",
@@ -2166,8 +2598,6 @@ fn run_plan_item(
         )?;
         write_runner_cli_artifacts(&run_dir, &output)?;
         if action == DomainAction::Setup {
-            let provider_id =
-                provider_id_for_pack(&item.pack.path, &item.pack.pack_id, provider_map);
             let providers_root = state_root
                 .join("state")
                 .join("runtime")
@@ -2198,10 +2628,25 @@ fn run_plan_item(
             team: team.map(|value| value.to_string()),
             input,
             dist_offline,
+        })
+        .map_err(|err| {
+            let message = err.to_string();
+            if message.contains("manifest.cbor is invalid") {
+                if let Ok(Some(detail)) = domains::manifest_cbor_issue_detail(&item.pack.path) {
+                    return anyhow::anyhow!(
+                        "pack verification failed for {}: {}",
+                        item.pack.path.display(),
+                        detail
+                    );
+                }
+                return anyhow::anyhow!(
+                    "pack verification failed for {}: {message}",
+                    item.pack.path.display()
+                );
+            }
+            err
         })?;
         if action == DomainAction::Setup {
-            let provider_id =
-                provider_id_for_pack(&item.pack.path, &item.pack.pack_id, provider_map);
             let providers_root = state_root
                 .join("state")
                 .join("runtime")
@@ -2227,13 +2672,10 @@ fn run_plan_item(
             let Some(secrets_bin) = secrets_bin else {
                 return Ok(());
             };
-            let env = secrets_env
-                .map(|value| value.to_string())
-                .unwrap_or_else(crate::tools::secrets::resolve_env);
             let status = crate::tools::secrets::run_init(
                 state_root,
                 Some(secrets_bin),
-                &env,
+                &env_value,
                 tenant,
                 team,
                 &item.pack.path,
@@ -2416,6 +2858,10 @@ fn build_input_payload(
     domain: Domain,
     tenant: &str,
     team: Option<&str>,
+    pack_id: Option<&str>,
+    setup_answers: Option<&serde_json::Value>,
+    public_base_url: Option<&str>,
+    env: &str,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "tenant": tenant,
@@ -2424,18 +2870,68 @@ fn build_input_payload(
         payload["team"] = serde_json::Value::String(team.to_string());
     }
 
-    match domain {
-        Domain::Messaging | Domain::Events => {
-            let mut config = serde_json::json!({});
-            if let Some(url) = read_public_base_url(root, tenant, team) {
-                payload["public_base_url"] = serde_json::Value::String(url);
-                config["public_base_url"] = payload["public_base_url"].clone();
-            }
-            payload["config"] = config;
-            payload
+    let resolved_public_base_url = public_base_url.map(|value| value.to_string()).or_else(|| {
+        if matches!(domain, Domain::Messaging | Domain::Events) {
+            read_public_base_url(root, tenant, team)
+        } else {
+            None
         }
-        Domain::Secrets => payload,
+    });
+
+    if matches!(domain, Domain::Messaging | Domain::Events) {
+        let mut config = serde_json::json!({});
+        if let Some(url) = resolved_public_base_url.as_ref() {
+            payload["public_base_url"] = serde_json::Value::String(url.clone());
+            config["public_base_url"] = serde_json::Value::String(url.clone());
+        }
+        payload["config"] = config;
     }
+
+    if let Some(pack_id) = pack_id
+        && let Some(config_map) = payload
+            .get_mut("config")
+            .and_then(|value| value.as_object_mut())
+    {
+        config_map.insert(
+            "id".to_string(),
+            serde_json::Value::String(pack_id.to_string()),
+        );
+    }
+    if let Some(pack_id) = pack_id {
+        payload["id"] = serde_json::Value::String(pack_id.to_string());
+    }
+    if let Some(answers) = setup_answers {
+        payload["setup_answers"] = answers.clone();
+        if let Ok(json) = serde_json::to_string(answers) {
+            payload["answers_json"] = serde_json::Value::String(json);
+        }
+    }
+    let mut tenant_ctx = serde_json::json!({
+        "env": env,
+        "tenant": tenant,
+        "tenant_id": tenant,
+    });
+    if let Some(team) = team {
+        tenant_ctx["team"] = serde_json::Value::String(team.to_string());
+        tenant_ctx["team_id"] = serde_json::Value::String(team.to_string());
+    }
+    let msg_id = pack_id
+        .map(|value| format!("{value}.setup"))
+        .unwrap_or_else(|| "setup".to_string());
+    let mut metadata = serde_json::json!({});
+    if let Some(url) = resolved_public_base_url {
+        metadata["public_base_url"] = serde_json::Value::String(url);
+    }
+    let msg = serde_json::json!({
+        "id": msg_id,
+        "tenant": tenant_ctx,
+        "channel": "setup",
+        "session_id": "setup",
+        "metadata": metadata,
+    });
+    payload["msg"] = msg;
+    payload["payload"] = serde_json::json!({});
+    payload
 }
 
 fn read_public_base_url(root: &Path, tenant: &str, team: Option<&str>) -> Option<String> {
@@ -2665,6 +3161,7 @@ impl From<DomainArg> for Domain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::BTreeSet, path::PathBuf};
 
     #[test]
     fn parse_kv_infers_basic_types() {
@@ -2720,5 +3217,33 @@ mod tests {
         };
         let error = ensure_requirements_flow(&pack).unwrap_err();
         assert!(error.contains("requirements flow not found"));
+    }
+
+    #[test]
+    fn filter_allowed_providers_moves_missing() {
+        let mut packs = vec![
+            domains::ProviderPack {
+                pack_id: "messaging-telegram".to_string(),
+                file_name: "telegram.gtpack".to_string(),
+                path: PathBuf::from("telegram.gtpack"),
+                entry_flows: vec!["setup_default".to_string()],
+            },
+            domains::ProviderPack {
+                pack_id: "messaging-slack".to_string(),
+                file_name: "slack.gtpack".to_string(),
+                path: PathBuf::from("slack.gtpack"),
+                entry_flows: vec!["setup_default".to_string()],
+            },
+        ];
+        let allowed = vec![
+            "messaging-telegram".to_string(),
+            "messaging-email".to_string(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let missing = filter_packs_by_allowed(&mut packs, &allowed);
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].pack_id, "messaging-telegram");
+        assert_eq!(missing, vec!["messaging-email".to_string()]);
     }
 }

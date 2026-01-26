@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -9,6 +12,7 @@ use crate::config::{DemoConfig, DemoProviderConfig};
 use crate::dev_mode::DevSettingsResolved;
 use crate::runner_integration;
 use crate::runtime_state::RuntimePaths;
+use crate::setup_input::{SetupInputAnswers, collect_setup_answers, load_setup_input};
 use greentic_runner_desktop::{RunResult, RunStatus};
 
 pub struct ProviderSetupOptions {
@@ -47,6 +51,15 @@ pub fn run_provider_setup(
     );
     let providers_root = runtime.runtime_root().join("providers");
     std::fs::create_dir_all(&providers_root)?;
+    let provider_keys: BTreeSet<String> = providers.iter().map(|(name, _)| name.clone()).collect();
+    let setup_input_answers = if let Some(path) = options.setup_input.as_ref() {
+        Some(SetupInputAnswers::new(
+            load_setup_input(path)?,
+            provider_keys.clone(),
+        )?)
+    } else {
+        None
+    };
 
     for (provider, cfg) in providers {
         let pack_path = resolve_pack_path(config_dir, &provider, &cfg)?;
@@ -78,11 +91,18 @@ pub fn run_provider_setup(
             .setup_flow
             .clone()
             .unwrap_or_else(|| "setup_default".to_string());
+        let answers = collect_setup_answers(
+            &pack_path,
+            &provider,
+            setup_input_answers.as_ref(),
+            setup_input_answers.is_none(),
+        )?;
         let input = build_input(
+            &provider,
             &config.tenant,
             &config.team,
             public_base_url,
-            options.setup_input.as_deref(),
+            Some(&answers),
         )?;
         let output = runner_integration::run_flow(&runner, &pack_path, &setup_flow, &input)?;
         write_run_output(&setup_path, &provider, &setup_flow, &output)?;
@@ -189,31 +209,43 @@ fn resolve_pack_path(
 }
 
 fn build_input(
+    pack_id: &str,
     tenant: &str,
     team: &str,
     public_base_url: Option<&str>,
-    override_path: Option<&Path>,
+    answers: Option<&Value>,
 ) -> anyhow::Result<Value> {
     let mut payload = serde_json::json!({
+        "id": pack_id,
         "tenant": tenant,
         "team": team,
         "env": "dev",
     });
+    let mut config = serde_json::json!({});
     if let Some(url) = public_base_url {
         payload["public_base_url"] = Value::String(url.to_string());
+        config["public_base_url"] = Value::String(url.to_string());
     }
-    if let Some(path) = override_path {
-        let contents = std::fs::read_to_string(path)?;
-        let override_value: Value = serde_json::from_str(&contents)?;
-        if let Some(base) = payload.as_object_mut() {
-            if let Value::Object(override_map) = override_value {
-                for (key, value) in override_map {
-                    base.insert(key, value);
-                }
-            } else {
-                payload = override_value;
-            }
-        }
+    config["id"] = Value::String(pack_id.to_string());
+    payload["config"] = config;
+    payload["msg"] = serde_json::json!({
+        "channel": "setup",
+        "id": format!("{pack_id}.setup"),
+        "message": {
+            "id": format!("{pack_id}.setup_default__collect"),
+            "text": "Collect inputs for setup_default."
+        },
+        "metadata": serde_json::json!({}),
+        "reply_scope": "",
+        "session_id": "setup",
+        "tenant_id": tenant,
+        "text": "Collect inputs for setup_default.",
+        "user_id": "operator"
+    });
+    payload["payload"] = serde_json::json!({});
+    if let Some(answers) = answers {
+        payload["setup_answers"] = answers.clone();
+        payload["answers_json"] = Value::String(serde_json::to_string(answers)?);
     }
     Ok(payload)
 }

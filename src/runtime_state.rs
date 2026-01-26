@@ -53,6 +53,10 @@ impl RuntimePaths {
     pub fn resolved_path(&self, service_id: &str) -> PathBuf {
         self.resolved_dir().join(format!("{service_id}.json"))
     }
+
+    pub fn logs_root(&self) -> PathBuf {
+        self.state_dir.join("logs")
+    }
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {

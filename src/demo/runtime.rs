@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,7 +16,7 @@ pub fn demo_up(
     team: Option<&str>,
     nats_url: Option<&str>,
     no_nats: bool,
-    messaging_command: Option<&str>,
+    messaging_enabled: bool,
     cloudflared: Option<CloudflaredConfig>,
     events_components: Vec<crate::services::ComponentSpec>,
 ) -> anyhow::Result<()> {
@@ -25,42 +25,49 @@ pub fn demo_up(
         let team_id = team.unwrap_or("default");
         let paths = RuntimePaths::new(&state_dir, tenant, team_id);
         let handle = cloudflared::start_quick_tunnel(&paths, &config)?;
-        println!("Public URL: {}", handle.url);
+        println!("Public URL (service=cloudflared): {}", handle.url);
     }
 
     let mut resolved_nats_url = nats_url.map(|value| value.to_string());
+    let mut nats_started = false;
     if !no_nats && resolved_nats_url.is_none() {
         if let Err(err) = services::start_nats(bundle_root) {
             eprintln!("Warning: failed to start NATS: {err}");
         } else {
             resolved_nats_url = Some(services::nats_url(bundle_root));
+            nats_started = true;
         }
     }
 
-    if let Some(messaging_command) = messaging_command {
-        let manifest_path = resolved_manifest_path(bundle_root, tenant, team);
-        let name = services::messaging_name(tenant, team);
-        let state = services::start_messaging_from_manifest(
-            bundle_root,
-            &manifest_path,
-            &name,
-            resolved_nats_url.as_deref(),
-            messaging_command,
-        )?;
-        println!("messaging: {:?}", state);
+    if messaging_enabled {
+        crate::services::run_services(bundle_root)?;
     } else {
         println!("messaging: skipped (disabled or no providers)");
     }
 
-    if !events_components.is_empty() {
+    let mut running_components = Vec::new();
+    if !events_components.is_empty() && resolved_nats_url.is_some() {
         let envs = build_env_kv(tenant, team, resolved_nats_url.as_deref());
         for component in events_components {
             let state = services::start_component(bundle_root, &component, &envs)?;
             println!("{}: {:?}", component.id, state);
+            running_components.push(component);
         }
     } else {
         println!("events: skipped (disabled or no providers)");
     }
+
+    for component in running_components {
+        let id = component.id;
+        let state = services::stop_component(bundle_root, &id)?;
+        println!("{id}: {:?}", state);
+    }
+
+    if nats_started {
+        let nats = services::stop_nats(bundle_root)?;
+        println!("nats: {:?}", nats);
+    }
+
     Ok(())
 }
 
@@ -104,7 +111,22 @@ pub fn demo_up_services(
 
     let public_base_url = if let Some(cfg) = cloudflared {
         let handle = cloudflared::start_quick_tunnel(&paths, &cfg)?;
-        println!("Public URL: {}", handle.url);
+        let mut domain_labels = Vec::new();
+        if discovery.domains.messaging {
+            domain_labels.push("messaging");
+        }
+        if discovery.domains.events {
+            domain_labels.push("events");
+        }
+        let domain_list = if domain_labels.is_empty() {
+            "none".to_string()
+        } else {
+            domain_labels.join(",")
+        };
+        println!(
+            "Public URL (service=cloudflared domains={domain_list}): {}",
+            handle.url
+        );
         Some(handle.url)
     } else {
         None
@@ -238,141 +260,6 @@ pub fn demo_up_services(
     Ok(())
 }
 
-pub fn demo_down_legacy(
-    bundle_root: &Path,
-    tenant: &str,
-    team: Option<&str>,
-    no_nats: bool,
-) -> anyhow::Result<()> {
-    let team = legacy_team(bundle_root, tenant, team);
-    let state = services::stop_messaging(bundle_root, tenant, team)?;
-    println!("messaging: {:?}", state);
-
-    for id in legacy_event_component_ids(bundle_root) {
-        let state = services::stop_component(bundle_root, &id)?;
-        println!("{id}: {:?}", state);
-    }
-
-    if !no_nats {
-        let nats = services::stop_nats(bundle_root)?;
-        println!("nats: {:?}", nats);
-    }
-
-    let team_id = team.unwrap_or("default");
-    let paths = RuntimePaths::new(bundle_root.join("state"), tenant, team_id);
-    let _ = supervisor::stop_pidfile(&paths.pid_path("cloudflared"), 2_000);
-    Ok(())
-}
-
-pub fn demo_status_legacy(
-    bundle_root: &Path,
-    tenant: &str,
-    team: Option<&str>,
-    no_nats: bool,
-) -> anyhow::Result<()> {
-    let team = legacy_team(bundle_root, tenant, team);
-    let messaging = services::messaging_status(bundle_root, tenant, team)?;
-    println!("messaging: {:?}", messaging);
-
-    for id in legacy_event_component_ids(bundle_root) {
-        let status = services::component_status(bundle_root, &id)?;
-        println!("{id}: {:?}", status);
-    }
-
-    if !no_nats {
-        let nats = services::nats_status(bundle_root)?;
-        println!("nats: {:?}", nats);
-    }
-
-    let team_id = team.unwrap_or("default");
-    let paths = RuntimePaths::new(bundle_root.join("state"), tenant, team_id);
-    if let Some(status) = supervisor::read_status(&paths)?
-        .into_iter()
-        .find(|status| status.id.as_str() == "cloudflared")
-    {
-        let state = if status.running { "running" } else { "stopped" };
-        let pid = status
-            .pid
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        println!("cloudflared: {} (pid={})", state, pid);
-    }
-    Ok(())
-}
-
-fn legacy_event_component_ids(bundle_root: &Path) -> Vec<String> {
-    let config = crate::config::load_operator_config(bundle_root)
-        .ok()
-        .flatten();
-    let services = config
-        .as_ref()
-        .and_then(|config| config.services.clone())
-        .unwrap_or_default();
-    let components = if services.events.components.is_empty() {
-        crate::config::default_events_components()
-    } else {
-        services.events.components
-    };
-    components
-        .into_iter()
-        .map(|component| component.id)
-        .collect()
-}
-
-pub fn demo_logs_legacy(
-    bundle_root: &Path,
-    tenant: &str,
-    team: Option<&str>,
-    service: Option<&str>,
-) -> anyhow::Result<()> {
-    let team = legacy_team(bundle_root, tenant, team);
-    match service {
-        Some("nats") => services::tail_nats_logs(bundle_root),
-        Some(service) if service.starts_with("events-") => {
-            let log = bundle_root
-                .join("state")
-                .join("logs")
-                .join(format!("{service}.log"));
-            services::tail_log(&log)
-        }
-        Some("cloudflared") => {
-            let team_id = team.unwrap_or("default");
-            let paths = RuntimePaths::new(bundle_root.join("state"), tenant, team_id);
-            services::tail_log(&paths.log_path("cloudflared"))
-        }
-        _ => {
-            let name = services::messaging_name(tenant, team);
-            let log = bundle_root
-                .join("state")
-                .join("logs")
-                .join(format!("{name}.log"));
-            if !log.exists() && team == Some("default") {
-                let fallback = services::messaging_name(tenant, None);
-                let fallback_log = bundle_root
-                    .join("state")
-                    .join("logs")
-                    .join(format!("{fallback}.log"));
-                if fallback_log.exists() {
-                    return services::tail_log(&fallback_log);
-                }
-            }
-            services::tail_log(&log)
-        }
-    }
-}
-
-fn legacy_team<'a>(bundle_root: &Path, tenant: &str, team: Option<&'a str>) -> Option<&'a str> {
-    let team = team?;
-    let team_manifest = bundle_root
-        .join("resolved")
-        .join(format!("{tenant}.{team}.yaml"));
-    if team_manifest.exists() {
-        Some(team)
-    } else {
-        None
-    }
-}
-
 pub fn demo_status_runtime(
     state_dir: &Path,
     tenant: &str,
@@ -414,7 +301,8 @@ pub fn demo_logs_runtime(
     tail: bool,
 ) -> anyhow::Result<()> {
     let paths = RuntimePaths::new(state_dir, tenant, team);
-    let log_path = paths.log_path(service);
+    let tenant_log_path = prepare_tenant_log_path(&paths, service, tenant, team)?;
+    let log_path = select_log_path(&paths, service, tenant, &tenant_log_path);
     if tail {
         return services::tail_log(&log_path);
     }
@@ -472,12 +360,47 @@ pub fn demo_down_runtime(
     Ok(())
 }
 
-fn resolved_manifest_path(root: &Path, tenant: &str, team: Option<&str>) -> std::path::PathBuf {
-    let filename = match team {
-        Some(team) => format!("{tenant}.{team}.yaml"),
-        None => format!("{tenant}.yaml"),
-    };
-    root.join("resolved").join(filename)
+fn select_log_path(
+    paths: &RuntimePaths,
+    service: &str,
+    tenant: &str,
+    tenant_log: &Path,
+) -> PathBuf {
+    let logs_root = paths.logs_root();
+    let mut candidates = Vec::new();
+    candidates.push(tenant_log.to_path_buf());
+    candidates.push(logs_root.join(format!("{service}.log")));
+    candidates.push(logs_root.join(format!("{service}-{tenant}.log")));
+    candidates.push(logs_root.join(format!("{service}.{tenant}.log")));
+    candidates.push(paths.log_path(service));
+    for candidate in &candidates {
+        if candidate.exists() {
+            return candidate.clone();
+        }
+    }
+    candidates.into_iter().next().unwrap()
+}
+
+fn prepare_tenant_log_path(
+    paths: &RuntimePaths,
+    service: &str,
+    tenant: &str,
+    team: &str,
+) -> anyhow::Result<PathBuf> {
+    let tenant_dir = paths.logs_dir().join(format!("{tenant}.{team}"));
+    let path = tenant_dir.join(format!("{service}.log"));
+    ensure_log_file(&path)?;
+    Ok(path)
+}
+
+fn ensure_log_file(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        std::fs::File::create(path)?;
+    }
+    Ok(())
 }
 
 fn build_env(

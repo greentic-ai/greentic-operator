@@ -1,6 +1,6 @@
 [package]
 name = "greentic-operator"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 rust-version = "1.90"
 description = "Greentic operator CLI for local dev and demo orchestration."
@@ -17,9 +17,17 @@ serde_cbor = "0.11"
 libc = "0.2"
 zip = "7"
 chrono = "0.4"
-sysinfo = "0.37"
+sysinfo = "0.38"
 directories-next = "2"
 greentic-runner-desktop = { version = "0.4" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "signal"] }
+gsm-gateway = { version = "0.4" }
+gsm-egress = { version = "0.4" }
+gsm-subscriptions-teams = { version = "0.4" }
+gsm-core = { version = "0.4" }
+rpassword = "7"
+greentic-secrets-lib = "0.4.14"
 
 [dev-dependencies]
 tempfile = "3.10"
+async-trait = "0.1"

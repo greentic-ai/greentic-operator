@@ -8,21 +8,12 @@ use crate::dev_mode::DevSettings;
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct OperatorConfig {
     #[serde(default)]
-    pub runtime: Option<RuntimeConfig>,
-    #[serde(default)]
     pub dev: Option<DevSettings>,
     #[serde(default)]
     pub services: Option<OperatorServicesConfig>,
     #[serde(default)]
     pub binaries: BTreeMap<String, String>,
 }
-
-#[derive(Clone, Debug, Deserialize, Default)]
-pub struct RuntimeConfig {
-    #[serde(default)]
-    pub messaging_command: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DomainEnabledMode {
@@ -71,12 +62,6 @@ pub struct ServiceComponentConfig {
     pub args: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct BinaryConfig {
-    pub name: String,
-    pub explicit_path: Option<PathBuf>,
-}
-
 pub fn load_operator_config(root: &Path) -> anyhow::Result<Option<OperatorConfig>> {
     let path = root.join("greentic.yaml");
     if !path.exists() {
@@ -91,39 +76,6 @@ pub fn load_operator_config(root: &Path) -> anyhow::Result<Option<OperatorConfig
     }
     let config: OperatorConfig = serde_yaml_bw::from_str(&contents)?;
     Ok(Some(config))
-}
-
-pub fn messaging_binary(config: Option<&OperatorConfig>, config_dir: &Path) -> BinaryConfig {
-    if let Some(config) = config {
-        if let Some(path) = config_binary_path(config, "greentic-messaging", config_dir) {
-            return BinaryConfig {
-                name: "greentic-messaging".to_string(),
-                explicit_path: Some(path),
-            };
-        }
-
-        if let Some(command) = config
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.messaging_command.as_ref())
-        {
-            if looks_like_path(command) {
-                return BinaryConfig {
-                    name: "greentic-messaging".to_string(),
-                    explicit_path: Some(resolve_path(config_dir, command)),
-                };
-            }
-            return BinaryConfig {
-                name: command.clone(),
-                explicit_path: None,
-            };
-        }
-    }
-
-    BinaryConfig {
-        name: "greentic-messaging".to_string(),
-        explicit_path: None,
-    }
 }
 
 pub fn binary_override(
@@ -316,10 +268,6 @@ fn resolve_path(base: &Path, value: &str) -> PathBuf {
     } else {
         base.join(path)
     }
-}
-
-fn looks_like_path(value: &str) -> bool {
-    value.contains('/') || value.contains('\\') || Path::new(value).is_absolute()
 }
 
 fn default_demo_tenant() -> String {

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_cbor::Value as CborValue;
 use zip::result::ZipError;
 
 use crate::domains::{self, Domain};
@@ -162,8 +163,14 @@ fn read_manifest_cbor_for_discovery(
     };
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)?;
-    let parsed: domains::PackManifestForDiscovery = serde_cbor::from_slice(&bytes)?;
-    Ok(Some(parsed))
+    let value: CborValue = serde_cbor::from_slice(&bytes)?;
+    if let Some(pack_id) = extract_pack_id_from_value(&value)? {
+        return Ok(Some(domains::PackManifestForDiscovery {
+            meta: None,
+            pack_id: Some(pack_id),
+        }));
+    }
+    Ok(None)
 }
 
 fn read_manifest_json_for_discovery(
@@ -179,6 +186,67 @@ fn read_manifest_json_for_discovery(
     std::io::Read::read_to_string(&mut file, &mut contents)?;
     let parsed: domains::PackManifestForDiscovery = serde_json::from_str(&contents)?;
     Ok(Some(parsed))
+}
+
+fn extract_pack_id_from_value(value: &CborValue) -> anyhow::Result<Option<String>> {
+    let CborValue::Map(map) = value else {
+        return Ok(None);
+    };
+    let symbols = match map_get(map, "symbols") {
+        Some(CborValue::Map(map)) => Some(map),
+        _ => None,
+    };
+
+    if let Some(pack_id) = map_get(map, "pack_id")
+        && let Some(value) = resolve_string_symbol(pack_id, symbols, "pack_ids")?
+    {
+        return Ok(Some(value));
+    }
+
+    if let Some(CborValue::Map(meta)) = map_get(map, "meta")
+        && let Some(pack_id) = map_get(meta, "pack_id")
+        && let Some(value) = resolve_string_symbol(pack_id, symbols, "pack_ids")?
+    {
+        return Ok(Some(value));
+    }
+
+    Ok(None)
+}
+
+fn resolve_string_symbol(
+    value: &CborValue,
+    symbols: Option<&std::collections::BTreeMap<CborValue, CborValue>>,
+    symbol_key: &str,
+) -> anyhow::Result<Option<String>> {
+    match value {
+        CborValue::Text(text) => Ok(Some(text.clone())),
+        CborValue::Integer(idx) => {
+            let Some(symbols) = symbols else {
+                return Ok(Some(idx.to_string()));
+            };
+            let Some(CborValue::Array(values)) = map_get(symbols, symbol_key)
+                .or_else(|| map_get(symbols, symbol_key.strip_suffix('s').unwrap_or(symbol_key)))
+            else {
+                return Ok(Some(idx.to_string()));
+            };
+            let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
+            match values.get(idx) {
+                Some(CborValue::Text(text)) => Ok(Some(text.clone())),
+                _ => Ok(Some(idx.to_string())),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn map_get<'a>(
+    map: &'a std::collections::BTreeMap<CborValue, CborValue>,
+    key: &str,
+) -> Option<&'a CborValue> {
+    map.iter().find_map(|(k, v)| match k {
+        CborValue::Text(text) if text == key => Some(v),
+        _ => None,
+    })
 }
 
 fn missing_cbor_error(path: &Path) -> anyhow::Error {

@@ -5,8 +5,6 @@ use super::{ensure_dir, write_if_missing};
 const DEFAULT_GMAP: &str = "_ = forbidden\n";
 const GREENTIC_YAML: &str = "\
 # greentic operator project
-runtime:
-  messaging_command: greentic-messaging
 # Optional binary overrides and dev-mode wiring
 dev:
   mode: auto

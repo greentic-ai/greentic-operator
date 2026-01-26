@@ -1,3 +1,4 @@
+use std::env;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,10 +42,14 @@ pub fn start_process(
     }
 
     if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_dir_logged(parent, "pid directory")?;
     }
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_dir_logged(parent, "log directory")?;
+    }
+    if !log_path.exists() {
+        // Ensure a log file exists before the child starts so early failures are captured.
+        std::fs::File::create(log_path)?;
     }
 
     let log_file = OpenOptions::new()
@@ -135,6 +140,36 @@ pub fn tail_log(path: &Path) -> anyhow::Result<()> {
         println!("{contents}");
         Ok(())
     }
+}
+
+fn ensure_dir_logged(path: &Path, description: &str) -> anyhow::Result<()> {
+    if demo_debug_enabled() {
+        println!("demo debug: ensuring {description} at {}", path.display());
+    }
+    match std::fs::create_dir_all(path) {
+        Ok(()) => {
+            if demo_debug_enabled() {
+                println!("demo debug: ensured {description}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if demo_debug_enabled() {
+                eprintln!(
+                    "demo debug: failed to create {description} at {}: {err}",
+                    path.display()
+                );
+            }
+            Err(err.into())
+        }
+    }
+}
+
+fn demo_debug_enabled() -> bool {
+    matches!(
+        env::var("GREENTIC_OPERATOR_DEMO_DEBUG").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
 }
 
 fn is_pid_running(pid_path: &Path) -> anyhow::Result<bool> {

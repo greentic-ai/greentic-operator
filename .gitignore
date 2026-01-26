@@ -1,2 +1,4 @@
 /target
 .greentic/
+seeds.yaml
+providers.json
