@@ -282,8 +282,12 @@ fn default_true() -> bool {
     true
 }
 
-fn default_nats_url() -> String {
+pub fn default_nats_url() -> String {
     "nats://127.0.0.1:4222".to_string()
+}
+
+pub fn default_receive_nats_url() -> String {
+    "nats://127.0.0.1:4347".to_string()
 }
 
 fn default_nats_binary() -> String {

@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 pub struct RuntimePaths {
     state_dir: PathBuf,
+    log_root: PathBuf,
     tenant: String,
     team: String,
 }
@@ -15,8 +16,15 @@ impl RuntimePaths {
         tenant: impl Into<String>,
         team: impl Into<String>,
     ) -> Self {
+        let state_dir = state_dir.into();
+        let log_root = state_dir
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("logs");
         Self {
-            state_dir: state_dir.into(),
+            state_dir,
+            log_root,
             tenant: tenant.into(),
             team: team.into(),
         }
@@ -35,7 +43,7 @@ impl RuntimePaths {
     }
 
     pub fn logs_dir(&self) -> PathBuf {
-        self.state_dir.join("logs").join(self.key())
+        self.log_root.join(self.key())
     }
 
     pub fn resolved_dir(&self) -> PathBuf {
@@ -55,7 +63,25 @@ impl RuntimePaths {
     }
 
     pub fn logs_root(&self) -> PathBuf {
-        self.state_dir.join("logs")
+        self.log_root.clone()
+    }
+
+    pub fn service_manifest_path(&self) -> PathBuf {
+        self.runtime_root().join("services.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logs_dir_uses_bundle_logs() {
+        let paths = RuntimePaths::new("/tmp/bundle/state", "demo", "default");
+        assert_eq!(
+            paths.logs_dir(),
+            PathBuf::from("/tmp/bundle/logs").join("demo.default")
+        );
     }
 }
 
@@ -84,5 +110,49 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(path);
     }
     std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct ServiceManifest {
+    #[serde(default)]
+    pub log_dir: Option<String>,
+    #[serde(default)]
+    pub services: Vec<ServiceEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ServiceEntry {
+    pub id: String,
+    pub kind: String,
+    pub log_path: Option<String>,
+}
+
+impl ServiceEntry {
+    pub fn new(id: impl Into<String>, kind: impl Into<String>, log_path: Option<&Path>) -> Self {
+        Self {
+            id: id.into(),
+            kind: kind.into(),
+            log_path: log_path.map(|path| path.display().to_string()),
+        }
+    }
+}
+
+pub fn persist_service_manifest(
+    paths: &RuntimePaths,
+    manifest: &ServiceManifest,
+) -> anyhow::Result<()> {
+    write_json(&paths.service_manifest_path(), manifest)
+}
+
+pub fn read_service_manifest(paths: &RuntimePaths) -> anyhow::Result<Option<ServiceManifest>> {
+    read_json(&paths.service_manifest_path())
+}
+
+pub fn remove_service_manifest(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let path = paths.service_manifest_path();
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
     Ok(())
 }

@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::bin_resolver::{self, ResolveCtx};
 use crate::config::{DemoConfig, DemoProviderConfig};
 use crate::dev_mode::DevSettingsResolved;
+use crate::operator_log;
 use crate::runner_integration;
 use crate::runtime_state::RuntimePaths;
 use crate::setup_input::{SetupInputAnswers, collect_setup_answers, load_setup_input};
@@ -23,6 +24,7 @@ pub struct ProviderSetupOptions {
     pub skip_secrets_init: bool,
     pub setup_input: Option<PathBuf>,
     pub runner_binary: Option<PathBuf>,
+    pub continue_on_error: bool,
 }
 
 pub fn run_provider_setup(
@@ -62,66 +64,79 @@ pub fn run_provider_setup(
     };
 
     for (provider, cfg) in providers {
-        let pack_path = resolve_pack_path(config_dir, &provider, &cfg)?;
-        if !options.skip_secrets_init {
-            let env = crate::tools::secrets::resolve_env();
-            let status = crate::tools::secrets::run_init(
-                config_dir,
-                secrets_bin.as_deref(),
-                &env,
-                &config.tenant,
-                Some(&config.team),
-                &pack_path,
-                true,
-            )?;
-            if !status.success() {
-                let code = status.code().unwrap_or(1);
-                return Err(anyhow::anyhow!(
-                    "greentic-secrets init failed with exit code {code}"
-                ));
+        let result = (|| -> anyhow::Result<()> {
+            let pack_path = resolve_pack_path(config_dir, &provider, &cfg)?;
+            if !options.skip_secrets_init {
+                let env = crate::tools::secrets::resolve_env();
+                let status = crate::tools::secrets::run_init(
+                    config_dir,
+                    secrets_bin.as_deref(),
+                    &env,
+                    &config.tenant,
+                    Some(&config.team),
+                    &pack_path,
+                    true,
+                )?;
+                if !status.success() {
+                    let code = status.code().unwrap_or(1);
+                    return Err(anyhow::anyhow!(
+                        "greentic-secrets init failed with exit code {code}"
+                    ));
+                }
             }
-        }
 
-        let setup_path = providers_root.join(format!("{provider}.setup.json"));
-        if setup_path.exists() && !options.force_setup {
-            continue;
-        }
+            let setup_path = providers_root.join(format!("{provider}.setup.json"));
+            if setup_path.exists() && !options.force_setup {
+                return Ok(());
+            }
 
-        let setup_flow = cfg
-            .setup_flow
-            .clone()
-            .unwrap_or_else(|| "setup_default".to_string());
-        let answers = collect_setup_answers(
-            &pack_path,
-            &provider,
-            setup_input_answers.as_ref(),
-            setup_input_answers.is_none(),
-        )?;
-        let input = build_input(
-            &provider,
-            &config.tenant,
-            &config.team,
-            public_base_url,
-            Some(&answers),
-        )?;
-        let output = runner_integration::run_flow(&runner, &pack_path, &setup_flow, &input)?;
-        write_run_output(&setup_path, &provider, &setup_flow, &output)?;
-
-        if options.verify_webhooks {
-            let verify_flow = cfg
-                .verify_flow
+            let setup_flow = cfg
+                .setup_flow
                 .clone()
-                .unwrap_or_else(|| "verify_webhooks".to_string());
-            let verify_path = providers_root.join(format!("{provider}.verify.json"));
-            if !verify_path.exists() || options.force_setup {
-                let output =
-                    runner_integration::run_flow(&runner, &pack_path, &verify_flow, &input)?;
-                write_run_output(&verify_path, &provider, &verify_flow, &output)?;
-            }
-        }
+                .unwrap_or_else(|| "setup_default".to_string());
+            let answers = collect_setup_answers(
+                &pack_path,
+                &provider,
+                setup_input_answers.as_ref(),
+                setup_input_answers.is_none(),
+            )?;
+            let input = build_input(
+                &provider,
+                &config.tenant,
+                &config.team,
+                public_base_url,
+                Some(&answers),
+            )?;
+            let output = runner_integration::run_flow(&runner, &pack_path, &setup_flow, &input)?;
+            write_run_output(&setup_path, &provider, &setup_flow, &output)?;
 
-        let status_path = providers_root.join(format!("{provider}.status.json"));
-        write_status(&status_path, &provider, &setup_path)?;
+            if options.verify_webhooks {
+                let verify_flow = cfg
+                    .verify_flow
+                    .clone()
+                    .unwrap_or_else(|| "verify_webhooks".to_string());
+                let verify_path = providers_root.join(format!("{provider}.verify.json"));
+                if !verify_path.exists() || options.force_setup {
+                    let output =
+                        runner_integration::run_flow(&runner, &pack_path, &verify_flow, &input)?;
+                    write_run_output(&verify_path, &provider, &verify_flow, &output)?;
+                }
+            }
+
+            let status_path = providers_root.join(format!("{provider}.status.json"));
+            write_status(&status_path, &provider, &setup_path)?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            if options.continue_on_error {
+                operator_log::error(
+                    module_path!(),
+                    format!("provider setup failed for {provider}: {err}"),
+                );
+                continue;
+            }
+            return Err(err);
+        }
     }
 
     Ok(())

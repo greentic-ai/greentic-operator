@@ -24,6 +24,7 @@ pub struct CloudflaredHandle {
 pub fn start_quick_tunnel(
     paths: &RuntimePaths,
     config: &CloudflaredConfig,
+    log_path: &Path,
 ) -> anyhow::Result<CloudflaredHandle> {
     let pid_path = paths.pid_path(SERVICE_ID);
     let url_path = public_url_path(paths);
@@ -34,17 +35,21 @@ pub fn start_quick_tunnel(
     if let Some(pid) = read_pid(&pid_path)?
         && supervisor::is_running(pid)
     {
+        let log_path_buf = log_path.to_path_buf();
         if let Some(url) = read_public_url(&url_path)? {
             return Ok(CloudflaredHandle {
                 url,
                 pid,
-                log_path: paths.log_path(SERVICE_ID),
+                log_path: log_path_buf.clone(),
             });
         }
-        let log_path = paths.log_path(SERVICE_ID);
-        let url = discover_public_url(&log_path, Duration::from_secs(10))?;
+        let url = discover_public_url(&log_path_buf, Duration::from_secs(10))?;
         write_public_url(&url_path, &url)?;
-        return Ok(CloudflaredHandle { url, pid, log_path });
+        return Ok(CloudflaredHandle {
+            url,
+            pid,
+            log_path: log_path_buf,
+        });
     }
 
     let mut argv = vec![
@@ -62,7 +67,8 @@ pub fn start_quick_tunnel(
         cwd: None,
         env: BTreeMap::new(),
     };
-    let handle = supervisor::spawn_service(paths, spec)?;
+    let log_path_buf = log_path.to_path_buf();
+    let handle = supervisor::spawn_service(paths, spec, Some(log_path_buf.clone()))?;
     let url = discover_public_url(&handle.log_path, Duration::from_secs(10))?;
     write_public_url(&url_path, &url)?;
     Ok(CloudflaredHandle {

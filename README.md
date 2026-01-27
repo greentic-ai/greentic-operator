@@ -57,6 +57,20 @@ Demo send (generic)
 greentic-operator demo send --bundle demo-bundle --provider telegram --print-required-args
 greentic-operator demo send --bundle demo-bundle --provider telegram --text "hi" --arg chat_id=123
 
+Demo new (bundle scaffold)
+
+greentic-operator demo new demo-bundle
+greentic-operator demo new demo-bundle --out /tmp
+
+Creates the directory layout plus minimal metadata (`greentic.demo.yaml`, `tenants/default/tenant.gmap`, `providers/*`, `state`, `resolved`, `logs`, etc.) so you can start adding packs and tenant definitions before running `demo setup`/`demo build`.
+
+Demo receive (incoming)
+
+Terminal A: `greentic-operator demo receive --bundle demo-bundle`
+Terminal B: `greentic-operator demo send --bundle demo-bundle --provider telegram --text "hi" --arg chat_id=123`
+
+`demo receive` listens for the bundle's messaging ingress subjects, streams each message to stdout, and appends a JSON line to `incoming.log`. Use `--provider` to focus on a single provider or `--all`/default to watch every enabled messaging pack.
+
 ## Domain auto-discovery
 
 Domains are enabled automatically when provider packs exist:

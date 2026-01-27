@@ -272,7 +272,7 @@ fn kill_process(pid: u32) -> anyhow::Result<()> {
 }
 
 pub fn log_path(root: &Path, name: &str) -> PathBuf {
-    root.join("state").join("logs").join(format!("{name}.log"))
+    root.join("logs").join(format!("{name}.log"))
 }
 
 pub fn pid_path(root: &Path, name: &str) -> PathBuf {
@@ -289,6 +289,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let pid = pid_path(temp.path(), "sleep");
         let log = log_path(temp.path(), "sleep");
+        assert_eq!(log, temp.path().join("logs").join("sleep.log"));
         let args = vec!["1".to_string()];
         let envs: Vec<(&str, String)> = Vec::new();
 

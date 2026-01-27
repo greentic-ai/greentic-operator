@@ -20,7 +20,7 @@ fn supervisor_spawns_and_stops_service() {
         env: BTreeMap::new(),
     };
 
-    let handle = spawn_service(&paths, spec).unwrap();
+    let handle = spawn_service(&paths, spec, None).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let log_contents = std::fs::read_to_string(handle.log_path).unwrap();

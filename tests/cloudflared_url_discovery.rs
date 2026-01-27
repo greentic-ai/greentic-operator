@@ -14,7 +14,12 @@ fn cloudflared_discovers_public_url() {
         restart: true,
     };
     let paths = RuntimePaths::new(temp.path(), "demo", "default");
-    let handle = start_quick_tunnel(&paths, &config).unwrap();
+    let log_path = temp.path().join("logs").join("cloudflared.log");
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let handle = start_quick_tunnel(&paths, &config, &log_path).unwrap();
+    assert_eq!(handle.log_path, log_path);
     assert_eq!(handle.url, "https://example.trycloudflare.com");
 
     let url_path = greentic_operator::cloudflared::public_url_path(&paths);

@@ -7,5 +7,5 @@ pub use components::{ComponentSpec, component_status, start_component, stop_comp
 pub use embedded::{
     EmbeddedServiceHandle, run_services, spawn_egress, spawn_gateway, spawn_subscriptions,
 };
-pub use nats::{nats_status, nats_url, start_nats, stop_nats, tail_nats_logs};
+pub use nats::{nats_status, nats_url, start_nats, start_nats_with_log, stop_nats, tail_nats_logs};
 pub use runner::{ProcessStatus, ServiceState, tail_log};

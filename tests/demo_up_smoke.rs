@@ -44,6 +44,7 @@ services:
     std::fs::write(&config_path, config_text).unwrap();
 
     let config: DemoConfig = load_demo_config(&config_path).unwrap();
+    let log_dir = temp.path().join("logs");
     demo_up_services(
         &config_path,
         &config,
@@ -58,7 +59,9 @@ services:
             skip_secrets_init: true,
             setup_input: None,
             runner_binary: None,
+            continue_on_error: true,
         },
+        &log_dir,
     )
     .unwrap();
 

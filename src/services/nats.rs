@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
@@ -8,9 +8,16 @@ use super::runner::{ProcessStatus, ServiceState, log_path, pid_path};
 const NATS_CONTAINER_PREFIX: &str = "greentic-operator-nats";
 
 pub fn start_nats(root: &Path) -> anyhow::Result<ServiceState> {
+    start_nats_with_log(root, None)
+}
+
+pub fn start_nats_with_log(
+    root: &Path,
+    log_path_override: Option<PathBuf>,
+) -> anyhow::Result<ServiceState> {
     let port = nats_port(root);
     let pid = pid_path(root, "nats");
-    let log = log_path(root, "nats");
+    let log = log_path_override.unwrap_or_else(|| log_path(root, "nats"));
     let container = container_name(root);
     let args = vec![
         "run".to_string(),

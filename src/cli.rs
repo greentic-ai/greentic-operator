@@ -1,14 +1,21 @@
 use std::{
     collections::BTreeSet,
-    env,
+    env, fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use anyhow::Context;
+use chrono::Utc;
+use futures_util::StreamExt;
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
+use base64::{Engine as _, engine::general_purpose};
 use clap::{Parser, Subcommand, ValueEnum};
 use greentic_runner_desktop::RunStatus;
+use gsm_core::{PROVIDER_ID_KEY, ingress_subject};
+use tokio::sync::Mutex;
 
 use crate::bin_resolver::{self, ResolveCtx};
 use crate::config;
@@ -21,6 +28,7 @@ use crate::dev_mode::{
 use crate::discovery;
 use crate::domains::{self, Domain, DomainAction};
 use crate::gmap::{self, Policy};
+use crate::operator_log;
 use crate::project::{self, ScanFormat};
 use crate::runner_exec;
 use crate::runner_integration;
@@ -98,6 +106,8 @@ enum DemoSubcommand {
     Up(DemoUpArgs),
     Setup(DemoSetupArgs),
     Send(DemoSendArgs),
+    Receive(DemoReceiveArgs),
+    New(DemoNewArgs),
     Down(DemoDownArgs),
     Status(DemoStatusArgs),
     Logs(DemoLogsArgs),
@@ -555,7 +565,7 @@ struct DemoUpArgs {
     #[arg(
         long,
         help_heading = "Optional options",
-        help = "URL of an existing NATS server to use instead of spawning one."
+        help = "URL of an existing NATS server to use instead of spawning one (default: nats://127.0.0.1:4222)."
     )]
     nats_url: Option<String>,
     #[arg(
@@ -624,6 +634,27 @@ struct DemoUpArgs {
         help = "Path to a greentic-runner binary override."
     )]
     runner_binary: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help_heading = "Optional options",
+        help = "Directory to write operator.log, cloudflared.log, and nats.log (default: ./logs or bundle/logs)."
+    )]
+    log_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Enable verbose operator logging (debug level).",
+        conflicts_with = "quiet"
+    )]
+    verbose: bool,
+    #[arg(
+        long,
+        help_heading = "Optional options",
+        help = "Suppress operator logging below warnings.",
+        conflicts_with = "verbose"
+    )]
+    quiet: bool,
     #[command(flatten)]
     dev: DevModeArgs,
 }
@@ -766,12 +797,12 @@ struct DemoStatusArgs {
 
 #[derive(Parser)]
 #[command(
-    about = "Show demo service logs using runtime state.",
-    long_about = "Prints or tails logs under state/logs for the selected service.",
-    after_help = "Main options:\n  <SERVICE> (messaging|nats|cloudflared)\n\nOptional options:\n  --tail\n  --tenant <TENANT> (default: demo)\n  --team <TEAM> (default: default)\n  --state-dir <PATH> (default: ./state or <bundle>/state)\n  --bundle <DIR> (legacy mode if --state-dir omitted)\n  --verbose\n  --no-nats"
+    about = "Show demo logs produced by the operator and services.",
+    long_about = "Prints or tails logs under logs/operator.log or tenant/service logs in the log directory.",
+    after_help = "Main options:\n  <SERVICE> (operator|messaging|nats|cloudflared)\n\nOptional options:\n  --tail\n  --tenant <TENANT> (default: demo)\n  --team <TEAM> (default: default)\n  --log-dir <PATH> (default: ./logs or <bundle>/logs)\n  --bundle <DIR>\n  --verbose\n  --no-nats"
 )]
 struct DemoLogsArgs {
-    #[arg(default_value = "messaging")]
+    #[arg(default_value = "operator")]
     service: String,
     #[arg(long)]
     tail: bool,
@@ -782,7 +813,7 @@ struct DemoLogsArgs {
     #[arg(long, default_value = "default")]
     team: String,
     #[arg(long)]
-    state_dir: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
     #[arg(long)]
     verbose: bool,
     #[arg(long)]
@@ -825,6 +856,40 @@ struct DemoSendArgs {
     team: String,
     #[arg(long)]
     print_required_args: bool,
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Stream inbound messaging ingress events from a demo bundle.",
+    long_about = "Subscribes to the bundle's messaging ingress subjects, prints each event, and appends the same data to incoming.log.",
+    after_help = "Main options:\n  --bundle <DIR> --provider <PROVIDER>|--all --tenant <TENANT> --team <TEAM>\n\nOptional options:\n  --nats-url <URL> (default: nats://127.0.0.1:4222)"
+)]
+struct DemoReceiveArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long, conflicts_with = "all")]
+    provider: Option<String>,
+    #[arg(long, conflicts_with = "provider")]
+    all: bool,
+    #[arg(long)]
+    nats_url: Option<String>,
+    #[arg(long, default_value = "demo")]
+    tenant: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Create a new demo bundle scaffold.",
+    long_about = "Initializes the directory layout and metadata files that the demo commands expect.",
+    after_help = "Main options:\n  <BUNDLE-NAME>\n\nOptional options:\n  --out <DIR> (default: current working directory)"
+)]
+struct DemoNewArgs {
+    #[arg(value_name = "BUNDLE-NAME")]
+    bundle: String,
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 #[derive(Parser)]
 #[command(
@@ -946,6 +1011,8 @@ impl DemoCommand {
             DemoSubcommand::Up(args) => args.run(ctx),
             DemoSubcommand::Setup(args) => args.run(),
             DemoSubcommand::Send(args) => args.run(),
+            DemoSubcommand::Receive(args) => args.run(),
+            DemoSubcommand::New(args) => args.run(),
             DemoSubcommand::Down(args) => args.run(),
             DemoSubcommand::Status(args) => args.run(),
             DemoSubcommand::Logs(args) => args.run(),
@@ -1084,6 +1151,7 @@ impl DevUpArgs {
         let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
 
         let mut nats_url = self.nats_url.clone();
+        let default_nats_url = config::default_nats_url();
         let mut nats_started = false;
         if !self.no_nats && nats_url.is_none() && (messaging_enabled || events_enabled) {
             if let Err(err) = crate::services::start_nats(&root) {
@@ -1092,6 +1160,9 @@ impl DevUpArgs {
                 nats_url = Some(crate::services::nats_url(&root));
                 nats_started = true;
             }
+        }
+        if !self.no_nats && nats_url.is_none() {
+            nats_url = Some(default_nats_url);
         }
 
         let mut event_specs = Vec::new();
@@ -1412,7 +1483,26 @@ impl DemoUpArgs {
     fn run(self, ctx: &AppCtx) -> anyhow::Result<()> {
         let restart: std::collections::BTreeSet<String> =
             self.restart.iter().map(restart_name).collect();
-        if let Some(bundle) = self.bundle {
+        let log_level = if self.quiet {
+            operator_log::Level::Warn
+        } else if self.verbose {
+            operator_log::Level::Debug
+        } else {
+            operator_log::Level::Info
+        };
+        if let Some(bundle) = self.bundle.clone() {
+            let log_dir = self.log_dir.clone().unwrap_or_else(|| bundle.join("logs"));
+            let log_dir = operator_log::init(log_dir.clone(), log_level)?;
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "demo up (bundle={} tenant={:?} team={:?}) log_dir={}",
+                    bundle.display(),
+                    self.tenant,
+                    self.team,
+                    log_dir.display()
+                ),
+            );
             if demo_debug_enabled() {
                 println!(
                     "[demo] up bundle={} tenant={:?} team={:?} no_nats={} nats_url={:?} cloudflared={:?}",
@@ -1434,6 +1524,17 @@ impl DemoUpArgs {
                 discovery::DiscoveryOptions { cbor_only: true },
             )?;
             discovery::persist(&bundle, &tenant, &discovery)?;
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "bundle discovery tenant={} team={} messaging={} events={} providers={}",
+                    tenant,
+                    self.team.as_deref().unwrap_or("default"),
+                    discovery.domains.messaging,
+                    discovery.domains.events,
+                    discovery.providers.len()
+                ),
+            );
             let services = config
                 .as_ref()
                 .and_then(|config| config.services.clone())
@@ -1447,6 +1548,17 @@ impl DemoUpArgs {
                 resolve_event_components(&bundle, config.as_ref(), &services, &dev_settings)?
             } else {
                 Vec::new()
+            };
+            let bundle_nats_url = crate::services::nats_url(&bundle);
+            let explicit_nats_url = self.nats_url.clone();
+            let nats_url_arg = if self.no_nats {
+                Some(
+                    explicit_nats_url
+                        .as_deref()
+                        .unwrap_or(bundle_nats_url.as_str()),
+                )
+            } else {
+                explicit_nats_url.as_deref()
             };
             let domains_to_setup = self.domain.resolve_domains(Some(&discovery));
 
@@ -1479,7 +1591,24 @@ impl DemoUpArgs {
                 && let Some(cfg) = cloudflared_config.as_mut()
             {
                 let paths = RuntimePaths::new(bundle.join("state"), &tenant, &team_id);
-                let handle = crate::cloudflared::start_quick_tunnel(&paths, cfg)?;
+                let setup_log = operator_log::reserve_service_log(&log_dir, "cloudflared")
+                    .with_context(|| "unable to open cloudflared.log")?;
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "starting setup-mode cloudflared log={}",
+                        setup_log.display()
+                    ),
+                );
+                let handle = crate::cloudflared::start_quick_tunnel(&paths, cfg, &setup_log)?;
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "cloudflared setup mode ready url={} log={}",
+                        handle.url,
+                        setup_log.display()
+                    ),
+                );
                 let domain_labels = domains_to_setup
                     .iter()
                     .map(|domain| domains::domain_name(*domain))
@@ -1512,19 +1641,47 @@ impl DemoUpArgs {
                 )?;
             }
 
-            return demo::demo_up(
+            let result = demo::demo_up(
                 &bundle,
                 &tenant,
                 self.team.as_deref(),
-                self.nats_url.as_deref(),
+                nats_url_arg,
                 self.no_nats,
                 messaging_enabled,
                 cloudflared_config,
                 events_components,
+                &log_dir,
             );
+            if let Err(ref err) = result {
+                operator_log::error(
+                    module_path!(),
+                    format!("demo up bundle {} failed: {err}", bundle.display()),
+                );
+            } else {
+                operator_log::info(
+                    module_path!(),
+                    format!("demo up bundle {} completed", bundle.display()),
+                );
+            }
+            return result;
         }
 
-        let config_path = resolve_demo_config_path(self.config)?;
+        let config_path = resolve_demo_config_path(self.config.clone())?;
+        let initial_log_dir = self
+            .log_dir
+            .clone()
+            .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).join("logs"));
+        let log_dir = operator_log::init(initial_log_dir.clone(), log_level)?;
+        operator_log::info(
+            module_path!(),
+            format!(
+                "demo up (config={}) tenant={:?} team={:?} log_dir={}",
+                config_path.display(),
+                self.tenant,
+                self.team,
+                log_dir.display()
+            ),
+        );
         let demo_config = config::load_demo_config(&config_path)?;
         let operator_config =
             config::load_operator_config(config_path.parent().unwrap_or(Path::new(".")))?;
@@ -1555,6 +1712,7 @@ impl DemoUpArgs {
             }
         };
 
+        let provider_setup_input = self.setup_input.clone();
         let provider_options = crate::providers::ProviderSetupOptions {
             providers: if self.providers.is_empty() {
                 None
@@ -1565,18 +1723,26 @@ impl DemoUpArgs {
             force_setup: self.force_setup,
             skip_setup: self.skip_setup,
             skip_secrets_init: self.skip_secrets_init,
-            setup_input: self.setup_input,
+            setup_input: provider_setup_input.clone(),
             runner_binary: self.runner_binary,
+            continue_on_error: provider_setup_input.is_none(),
         };
 
-        demo::demo_up_services(
+        let result = demo::demo_up_services(
             &config_path,
             &demo_config,
             dev_settings,
             cloudflared,
             &restart,
             provider_options,
-        )
+            &log_dir,
+        );
+        if let Err(ref err) = result {
+            operator_log::error(module_path!(), format!("demo up services failed: {err}"));
+        } else {
+            operator_log::info(module_path!(), "demo up services completed");
+        }
+        result
     }
 }
 
@@ -1772,6 +1938,342 @@ impl DemoSendArgs {
         Err(anyhow::anyhow!(message))
     }
 }
+
+impl DemoReceiveArgs {
+    fn run(self) -> anyhow::Result<()> {
+        let team = if self.team.is_empty() {
+            None
+        } else {
+            Some(self.team.as_str())
+        };
+        let providers = discover_demo_messaging_providers(&self.bundle, &self.tenant, team)?;
+        if providers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no messaging providers found in bundle {}",
+                self.bundle.display()
+            ));
+        }
+        let selected = select_demo_providers(&providers, self.provider.as_deref())?;
+        let provider_ids = selected
+            .iter()
+            .map(|info| info.provider_id.clone())
+            .collect::<BTreeSet<_>>();
+        let filter_active = self.provider.is_some();
+        let env = crate::tools::secrets::resolve_env();
+        let team_name = team.unwrap_or("default");
+        let subject_filter = ingress_subject_filter(&env, &self.tenant, team_name);
+        let provider_list = selected
+            .iter()
+            .map(|info| info.provider_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let log_path = PathBuf::from("incoming.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let log_writer = Arc::new(Mutex::new(std::io::BufWriter::new(file)));
+
+        println!("listening for inbound messages on {}", subject_filter);
+        println!("providers: {}", provider_list);
+        println!("logging to {}", log_path.display());
+
+        let nats_urls = resolve_receive_nats_urls(self.nats_url.clone());
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(run_demo_receive_async(
+            nats_urls,
+            subject_filter,
+            provider_ids,
+            filter_active,
+            log_writer,
+        ))?;
+        Ok(())
+    }
+}
+
+impl DemoNewArgs {
+    fn run(self) -> anyhow::Result<()> {
+        let base = self
+            .out
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let bundle_path = PathBuf::from(&self.bundle);
+        let target = if bundle_path.is_absolute() {
+            bundle_path
+        } else {
+            base.join(bundle_path)
+        };
+        if target.exists() {
+            return Err(anyhow::anyhow!(
+                "bundle path {} already exists",
+                target.display()
+            ));
+        }
+        create_demo_bundle_structure(&target)?;
+        println!("created demo bundle scaffold at {}", target.display());
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct DemoProviderInfo {
+    pack: domains::ProviderPack,
+    provider_id: String,
+}
+
+fn discover_demo_messaging_providers(
+    bundle: &Path,
+    tenant: &str,
+    team: Option<&str>,
+) -> anyhow::Result<Vec<DemoProviderInfo>> {
+    let is_demo_bundle = bundle.join("greentic.demo.yaml").exists();
+    let mut packs = if is_demo_bundle {
+        domains::discover_provider_packs_cbor_only(bundle, Domain::Messaging)?
+    } else {
+        domains::discover_provider_packs(bundle, Domain::Messaging)?
+    };
+    if is_demo_bundle
+        && let Some(allowed) = demo_provider_files(bundle, tenant, team, Domain::Messaging)?
+    {
+        packs.retain(|pack| allowed.contains(&pack.file_name));
+    }
+    let discovery =
+        discovery::discover_with_options(bundle, discovery::DiscoveryOptions { cbor_only: true })?;
+    let provider_map = discovery_map(&discovery.providers);
+    let entries = packs
+        .into_iter()
+        .map(|pack| DemoProviderInfo {
+            provider_id: provider_id_for_pack(&pack.path, &pack.pack_id, Some(&provider_map)),
+            pack,
+        })
+        .collect();
+    Ok(entries)
+}
+
+fn select_demo_providers(
+    providers: &[DemoProviderInfo],
+    provider_filter: Option<&str>,
+) -> anyhow::Result<Vec<DemoProviderInfo>> {
+    if let Some(filter) = provider_filter {
+        let matches: Vec<_> = providers
+            .iter()
+            .filter(|info| provider_filter_matches(&info.pack, filter))
+            .cloned()
+            .collect();
+        match matches.len() {
+            0 => Err(anyhow::anyhow!(
+                "No provider packs matched '{}'; try a more specific identifier.",
+                filter
+            )),
+            1 => Ok(matches),
+            _ => Err(anyhow::anyhow!(
+                "Multiple provider packs matched '{}'; provide a more specific identifier.",
+                filter
+            )),
+        }
+    } else {
+        Ok(providers.to_vec())
+    }
+}
+
+fn ingress_subject_filter(env: &str, tenant: &str, team: &str) -> String {
+    let base = ingress_subject(env, tenant, team, "__provider__");
+    if let Some(pos) = base.rfind('.') {
+        format!("{}.*", &base[..pos])
+    } else {
+        format!("{}.*", base)
+    }
+}
+
+fn resolve_receive_nats_urls(explicit: Option<String>) -> Vec<String> {
+    if let Some(url) = explicit {
+        vec![url]
+    } else {
+        vec![config::default_receive_nats_url()]
+    }
+}
+
+async fn connect_to_nats(urls: &[String]) -> anyhow::Result<(async_nats::Client, String)> {
+    let mut failures = Vec::new();
+    for url in urls {
+        match async_nats::connect(url).await {
+            Ok(client) => return Ok((client, url.clone())),
+            Err(err) => {
+                eprintln!("failed to connect to {}: {}; trying next", url, err);
+                failures.push(format!("{url}: {err}"));
+            }
+        }
+    }
+    let message = if failures.is_empty() {
+        "no URLs were provided".to_string()
+    } else {
+        failures.join("; ")
+    };
+    Err(anyhow::anyhow!(
+        "unable to connect to any configured NATS URL ({}): {message}",
+        urls.join(", ")
+    ))
+}
+
+async fn run_demo_receive_async(
+    nats_urls: Vec<String>,
+    subject_filter: String,
+    provider_ids: BTreeSet<String>,
+    filter_active: bool,
+    log_writer: Arc<Mutex<std::io::BufWriter<std::fs::File>>>,
+) -> anyhow::Result<()> {
+    let (client, connected_url) = connect_to_nats(&nats_urls).await?;
+    let mut subscription = client.subscribe(subject_filter.clone()).await?;
+    println!("connected to NATS at {}", connected_url);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                println!("interrupt received; shutting down receive loop");
+                break;
+            }
+            message = subscription.next() => match message {
+                Some(message) => {
+                    let provider_name = provider_id_from_message(&message.payload);
+                    if !should_log_message(provider_name.as_deref(), &provider_ids, filter_active) {
+                        continue;
+                    }
+                    let timestamp = Utc::now().to_rfc3339();
+                    let payload_text = format_payload_display(&message.payload);
+                    let headers = format_headers_json(&message.headers);
+                    let entry = json!({
+                        "timestamp": timestamp,
+                        "subject": message.subject.clone(),
+                        "provider": provider_name,
+                        "payload": payload_text,
+                        "headers": headers,
+                    });
+                    let line = serde_json::to_string(&entry)?;
+                    {
+                        let mut writer = log_writer.lock().await;
+                        writeln!(writer, "{line}")?;
+                        writer.flush()?;
+                    }
+                    println!("{line}");
+                }
+                None => {
+                    println!("subscription closed");
+                    break;
+                }
+            }
+        }
+    }
+    subscription.unsubscribe().await?;
+    println!("receive listener stopped (subject={subject_filter})");
+    Ok(())
+}
+
+fn should_log_message(
+    provider_name: Option<&str>,
+    provider_ids: &BTreeSet<String>,
+    filter_active: bool,
+) -> bool {
+    match provider_name {
+        Some(name) => provider_ids.contains(name),
+        None => !filter_active,
+    }
+}
+
+fn provider_id_from_message(payload: &[u8]) -> Option<String> {
+    let parsed: JsonValue = serde_json::from_slice(payload).ok()?;
+    parsed
+        .get("payload")
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get(PROVIDER_ID_KEY))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn format_payload_display(payload: &[u8]) -> String {
+    match std::str::from_utf8(payload) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            let encoded = general_purpose::STANDARD.encode(payload);
+            format!("base64:{encoded}")
+        }
+    }
+}
+
+fn format_headers_json(headers: &Option<async_nats::HeaderMap>) -> Option<JsonValue> {
+    let headers = headers.as_ref()?;
+    let mut map = serde_json::Map::new();
+    for (name, values) in headers.iter() {
+        let key = name.to_string();
+        for value in values {
+            let text = value.to_string();
+            if text.is_empty() {
+                continue;
+            }
+            let entry = map
+                .entry(key.clone())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let serde_json::Value::Array(array) = entry {
+                array.push(JsonValue::String(text));
+            }
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(JsonValue::Object(map))
+    }
+}
+
+const DEMO_CONFIG_CONTENT: &str = "version: \"1\"\nproject_root: \"./\"\n";
+const DEFAULT_DEMO_GMAP: &str = "_ = forbidden\n";
+
+fn create_demo_bundle_structure(root: &Path) -> anyhow::Result<()> {
+    let directories = [
+        "",
+        "providers",
+        "providers/messaging",
+        "providers/events",
+        "providers/secrets",
+        "packs",
+        "resolved",
+        "state",
+        "state/resolved",
+        "state/runs",
+        "state/pids",
+        "state/logs",
+        "state/runtime",
+        "state/doctor",
+        "tenants",
+        "tenants/default",
+        "tenants/default/teams",
+        "logs",
+    ];
+    for directory in directories {
+        ensure_dir(&root.join(directory))?;
+    }
+    write_if_missing(&root.join("greentic.demo.yaml"), DEMO_CONFIG_CONTENT)?;
+    write_if_missing(
+        &root.join("tenants").join("default").join("tenant.gmap"),
+        DEFAULT_DEMO_GMAP,
+    )?;
+    Ok(())
+}
+
+fn ensure_dir(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn write_if_missing(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::write(path, contents)?;
+    Ok(())
+}
 fn restart_name(target: &RestartTarget) -> String {
     match target {
         RestartTarget::All => "all",
@@ -1836,11 +2338,12 @@ impl DemoStatusArgs {
 
 impl DemoLogsArgs {
     fn run(self) -> anyhow::Result<()> {
-        let state_dir = resolve_state_dir(self.state_dir, self.bundle.as_ref());
+        let log_dir = resolve_log_dir(self.log_dir.clone(), self.bundle.as_ref());
+        let state_dir = resolve_state_dir(None, self.bundle.as_ref());
         if demo_debug_enabled() {
             println!(
-                "[demo] logs state_dir={} tenant={} team={} service={} tail={}",
-                state_dir.display(),
+                "[demo] logs log_dir={} tenant={} team={} service={} tail={}",
+                log_dir.display(),
                 self.tenant,
                 self.team,
                 self.service,
@@ -1849,6 +2352,7 @@ impl DemoLogsArgs {
         }
         demo::demo_logs_runtime(
             &state_dir,
+            &log_dir,
             &self.tenant,
             &self.team,
             &self.service,
@@ -1899,6 +2403,38 @@ fn resolve_state_dir(state_dir: Option<PathBuf>, bundle: Option<&PathBuf>) -> Pa
     PathBuf::from("state")
 }
 
+fn resolve_log_dir(log_dir: Option<PathBuf>, bundle: Option<&PathBuf>) -> PathBuf {
+    if let Some(path) = log_dir {
+        return path;
+    }
+    if let Some(bundle) = bundle {
+        return bundle.join("logs");
+    }
+    PathBuf::from("logs")
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_explicit_log_dir() {
+        let dir = PathBuf::from("/tmp/logs");
+        assert_eq!(resolve_log_dir(Some(dir.clone()), None), dir);
+    }
+
+    #[test]
+    fn resolves_bundle_log_dir() {
+        let bundle = PathBuf::from("/tmp/bundle");
+        assert_eq!(resolve_log_dir(None, Some(&bundle)), bundle.join("logs"));
+    }
+
+    #[test]
+    fn resolves_default_log_dir() {
+        assert_eq!(resolve_log_dir(None, None), PathBuf::from("logs"));
+    }
+}
+
 fn demo_debug_enabled() -> bool {
     matches!(
         std::env::var("GREENTIC_OPERATOR_DEMO_DEBUG").as_deref(),
@@ -1938,6 +2474,13 @@ fn run_demo_up_setup(
                 println!(
                     "[demo] no tenants discovered for domain {}; skipping",
                     domains::domain_name(*domain)
+                );
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "no tenants discovered for domain {}; skipping setup",
+                        domains::domain_name(*domain)
+                    ),
                 );
                 continue;
             }
@@ -2251,8 +2794,24 @@ fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
                 domains::domain_name(args.domain),
                 missing.join(", ")
             );
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "provider filter domain={} removed packs: {}",
+                    domains::domain_name(args.domain),
+                    missing.join(", ")
+                ),
+            );
         }
     }
+    operator_log::info(
+        module_path!(),
+        format!(
+            "provider selection domain={} packs={}",
+            domains::domain_name(args.domain),
+            packs.len()
+        ),
+    );
     let setup_answers = if let Some(preloaded) = args.preloaded_setup_answers.clone() {
         Some(preloaded)
     } else if let Some(path) = args.setup_input.as_ref() {
@@ -2274,12 +2833,41 @@ fn run_domain_command(args: DomainRunArgs) -> anyhow::Result<()> {
         args.allow_missing_setup,
     )?;
 
+    operator_log::info(
+        module_path!(),
+        format!(
+            "plan domain={} action={:?} items={}",
+            domains::domain_name(args.domain),
+            args.action,
+            plan.len()
+        ),
+    );
+    for item in &plan {
+        operator_log::debug(
+            module_path!(),
+            format!(
+                "plan item domain={} pack={} flow={}",
+                domains::domain_name(args.domain),
+                item.pack.file_name,
+                item.flow_id
+            ),
+        );
+    }
+
     if plan.is_empty() {
         if is_demo_bundle {
             println!("No provider packs matched. Try --provider <pack_id>.");
         } else {
             println!("No provider packs matched. Try --provider <pack_id> or --project-root.");
         }
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "no provider packs matched domain={} action={:?}",
+                domains::domain_name(args.domain),
+                args.action
+            ),
+        );
         return Ok(());
     }
 
@@ -3247,5 +3835,62 @@ mod tests {
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].pack_id, "messaging-telegram");
         assert_eq!(missing, vec!["messaging-email".to_string()]);
+    }
+
+    #[test]
+    fn demo_receive_args_provider_all_conflict() {
+        let result = DemoReceiveArgs::try_parse_from(&[
+            "greentic-operator",
+            "--bundle",
+            ".",
+            "--provider",
+            "messaging-telegram",
+            "--all",
+        ]);
+        assert!(result.is_err(), "provider and all should conflict");
+    }
+
+    #[test]
+    fn ingress_subject_filter_slices_platform() {
+        let env = "dev env";
+        let tenant = "acme tenant";
+        let team = "team/with slash";
+        let filter = ingress_subject_filter(env, tenant, team);
+        let base = ingress_subject(env, tenant, team, "__provider__");
+        let expected = if let Some(pos) = base.rfind('.') {
+            format!("{}.*", &base[..pos])
+        } else {
+            format!("{}.*", base)
+        };
+        assert_eq!(filter, expected);
+    }
+
+    #[test]
+    fn select_demo_providers_respects_filter() {
+        let providers = vec![
+            DemoProviderInfo {
+                provider_id: "messaging-telegram".to_string(),
+                pack: domains::ProviderPack {
+                    pack_id: "messaging-telegram".to_string(),
+                    file_name: "messaging-telegram.gtpack".to_string(),
+                    path: PathBuf::from("messaging-telegram.gtpack"),
+                    entry_flows: Vec::new(),
+                },
+            },
+            DemoProviderInfo {
+                provider_id: "messaging-slack".to_string(),
+                pack: domains::ProviderPack {
+                    pack_id: "messaging-slack".to_string(),
+                    file_name: "messaging-slack.gtpack".to_string(),
+                    path: PathBuf::from("messaging-slack.gtpack"),
+                    entry_flows: Vec::new(),
+                },
+            },
+        ];
+        let all = select_demo_providers(&providers, None).unwrap();
+        assert_eq!(all.len(), providers.len());
+        let single = select_demo_providers(&providers, Some("messaging-slack")).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].provider_id, "messaging-slack");
     }
 }

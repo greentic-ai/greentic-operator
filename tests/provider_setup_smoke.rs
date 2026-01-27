@@ -35,6 +35,7 @@ fn provider_setup_writes_outputs() {
         skip_secrets_init: true,
         setup_input: None,
         runner_binary: Some(fake_bin("fake_runner")),
+        continue_on_error: true,
     };
 
     run_provider_setup(

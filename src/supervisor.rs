@@ -65,9 +65,15 @@ pub struct ResolvedService {
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
 }
 
-pub fn spawn_service(paths: &RuntimePaths, spec: ServiceSpec) -> anyhow::Result<ServiceHandle> {
+pub fn spawn_service(
+    paths: &RuntimePaths,
+    spec: ServiceSpec,
+    log_path_override: Option<PathBuf>,
+) -> anyhow::Result<ServiceHandle> {
     if spec.argv.is_empty() {
         return Err(anyhow::anyhow!("service argv cannot be empty"));
     }
@@ -82,7 +88,7 @@ pub fn spawn_service(paths: &RuntimePaths, spec: ServiceSpec) -> anyhow::Result<
         ));
     }
 
-    let log_path = paths.log_path(spec.id.as_str());
+    let log_path = log_path_override.unwrap_or_else(|| paths.log_path(spec.id.as_str()));
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -113,6 +119,7 @@ pub fn spawn_service(paths: &RuntimePaths, spec: ServiceSpec) -> anyhow::Result<
         argv: spec.argv.clone(),
         cwd: spec.cwd.clone(),
         env: spec.env.clone(),
+        log_path: Some(log_path.clone()),
     };
     write_json(&paths.resolved_path(spec.id.as_str()), &resolved)?;
 
@@ -171,11 +178,19 @@ pub fn read_status(paths: &RuntimePaths) -> anyhow::Result<Vec<ServiceStatus>> {
         let id = ServiceId::new(stem.to_string())?;
         let pid = read_pid(&path)?;
         let running = pid.map(is_running).unwrap_or(false);
+        let log_path = if let Some(resolved) = read_resolved(paths, &id)? {
+            resolved
+                .log_path
+                .or_else(|| Some(paths.log_path(stem)))
+                .unwrap()
+        } else {
+            paths.log_path(stem)
+        };
         statuses.push(ServiceStatus {
             id,
             running,
             pid,
-            log_path: paths.log_path(stem),
+            log_path,
             last_error: None,
         });
     }

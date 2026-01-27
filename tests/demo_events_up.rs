@@ -44,7 +44,7 @@ fn demo_up_starts_events_services_when_events_packs_exist() {
     );
     std::fs::write(root.join("greentic.yaml"), config).unwrap();
 
-    let status = Command::new(fake_bin("greentic-operator"))
+    let output = Command::new(fake_bin("greentic-operator"))
         .args([
             "demo",
             "up",
@@ -56,14 +56,12 @@ fn demo_up_starts_events_services_when_events_packs_exist() {
             "--cloudflared",
             "off",
         ])
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success());
-
-    let events_ingress_pid = root.join("state").join("pids").join("events-ingress.pid");
-    let events_worker_pid = root.join("state").join("pids").join("events-worker.pid");
-    assert!(events_ingress_pid.exists());
-    assert!(events_worker_pid.exists());
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("events-ingress: Started"));
+    assert!(stdout.contains("events-worker: Started"));
 
     let _ = Command::new(fake_bin("greentic-operator"))
         .args([

@@ -10,7 +10,7 @@ use crate::tools::secrets;
 #[derive(Parser)]
 #[command(
     about = "Passthrough to greentic-secrets (init/set/get/list/delete).",
-    long_about = "Forwards commands to greentic-secrets with tenant/team/env defaults and streams output to state/logs/secrets.",
+    long_about = "Forwards commands to greentic-secrets with tenant/team/env defaults and streams output to logs/secrets.",
     after_help = "Main options:\n  (none)\n\nOptional options:\n  (none)"
 )]
 pub struct DevSecretsCommand {
