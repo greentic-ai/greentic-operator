@@ -46,6 +46,10 @@ impl RuntimePaths {
         self.log_root.join(self.key())
     }
 
+    pub fn dlq_log_path(&self) -> PathBuf {
+        self.logs_dir().join("dlq.log")
+    }
+
     pub fn resolved_dir(&self) -> PathBuf {
         self.runtime_root().join("resolved")
     }

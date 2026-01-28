@@ -13,10 +13,9 @@ greentic-operator demo new demo-bundle
 greentic-operator demo setup --bundle demo-bundle --tenant default --team default
 greentic-operator demo build --bundle demo-bundle --tenant default --team default
 greentic-operator demo start --bundle demo-bundle --tenant default --team default
-greentic-operator demo stop --bundle demo-bundle --tenant default --team default
 ```
 
-`demo start` is the canonical, long-running invocation: it boots the demo services in the foreground and waits for **Ctrl+C** to trigger a clean shutdown sequence. Use `demo stop` when you need a scripted or state-based teardown (for example, in CI or debug automation).
+`demo start` is the canonical, long-running invocation: it boots the demo services in the foreground and waits for **Ctrl+C** to trigger a clean shutdown sequence. Press **Ctrl+C** in the terminal running the command to stop the services.
 
 Access mapping (.gmap)
 
@@ -70,6 +69,26 @@ Terminal A: `greentic-operator demo receive --bundle demo-bundle`
 Terminal B: `greentic-operator demo send --bundle demo-bundle --provider telegram --text "hi" --arg chat_id=123`
 
 `demo receive` listens for the bundle's messaging ingress subjects, streams each message to stdout, and appends a JSON line to `incoming.log`. Use `--provider` to focus on a single provider or `--all`/default to watch every enabled messaging pack.
+
+### demo ingress (synthetic HTTP)
+
+`greentic-operator demo ingress` lets you exercise the universal HTTP ingress and operator outbound pipeline without running a full HTTP gateway. It constructs an `HttpInV1` body, invokes the provider `ingest_http` flow, prints the HTTP response plus any `ChannelMessageEnvelope` events, and (with `--end-to-end`) pushes the events through the app + render/encode/send flow.
+
+Key flags:
+
+- `--provider <name>` (required): provider pack or ID (slack, telegram, teams, webex, whatsapp, webchat, email, dummy, etc.).
+- `--bundle <dir>` (required): demo bundle directory containing the provider packs.
+- `--path <path>`: overrides the default `/ingress/<provider>/webhook` path (or `/ingress/<provider>/<binding_id>` when `--binding-id` is set).
+- `--method <GET|POST>`: choose the HTTP method (default `POST`).
+- `--body`, `--body-json`, `--body-raw`: body source (only one allowed).
+- `--binding-id <id>`: populate the binding ID/route for Telegram-style callbacks.
+- `--print <http|events|all>`: control printed output (defaults to `all`).
+- `--end-to-end`: invoke `render_plan`, `encode`, and `send_payload` for each event.
+- `--send`/`--dry-run`: choose whether `send_payload` actually fires (default dry-run when end-to-end).
+- `--retries <n>`: cap the retry attempts when `send_payload` returns `node-error`.
+- `--dlq-tail`: prints the shared `dlq.log` path (same file the runtime uses).
+
+Use `--tenant`/`--team`/`--correlation-id` to simulate the context headers that would arrive via a real gateway. Add `--app-pack` to target a custom app pack override instead of the demo’s default selection.
 
 ## Domain auto-discovery
 

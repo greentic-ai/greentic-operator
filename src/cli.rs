@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use base64::{Engine as _, engine::general_purpose};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use gsm_core::{PROVIDER_ID_KEY, ingress_subject_with_prefix};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
@@ -111,18 +111,21 @@ enum DevSubcommand {
 #[derive(Subcommand)]
 enum DemoSubcommand {
     Build(DemoBuildArgs),
-    Start(DemoUpArgs),
+    #[command(hide = true)]
     Up(DemoUpArgs),
+    Start(DemoUpArgs),
     Setup(DemoSetupArgs),
     Send(DemoSendArgs),
     Receive(DemoReceiveArgs),
+    #[command(about = "Send a synthetic HTTP request through the messaging ingress pipeline")]
+    Ingress(DemoIngressArgs),
     New(DemoNewArgs),
-    Stop(DemoDownArgs),
-    Down(DemoDownArgs),
     Status(DemoStatusArgs),
     Logs(DemoLogsArgs),
     Doctor(DemoDoctorArgs),
+    #[command(about = "Allow a tenant/team access to a pack/flow/node")]
     Allow(DemoPolicyArgs),
+    #[command(about = "Forbid a tenant/team access to a pack/flow/node")]
     Forbid(DemoPolicyArgs),
 }
 
@@ -780,7 +783,6 @@ struct DemoSetupArgs {
 
 #[derive(Parser)]
 #[command(
-    about = "Allow/forbid a gmap rule inside a demo bundle.",
     long_about = "Updates the demo bundle's gmap, reruns the resolver, and copies the updated manifest so demo start sees the change immediately.",
     after_help = "Main options:\n  --bundle <DIR>\n  --tenant <TENANT>\n  --path <PACK[/FLOW[/NODE]] (up to 3 segments)\n\nOptional options:\n  --team <TEAM>\n\nPaths use the same PACK[/FLOW[/NODE]] syntax as the dev allow/forbid commands (max 3 segments). The command modifies tenants/<tenant>[/teams/<team>]/(tenant|team).gmap, resolves state/resolved/<tenant>[.<team>].yaml, and overwrites resolved/<tenant>[.<team>].yaml so demo start picks it up without a rebuild."
 )]
@@ -794,29 +796,6 @@ struct DemoPolicyArgs {
     #[arg(long, help = "Gmap path to allow or forbid.")]
     path: String,
 }
-#[derive(Parser)]
-#[command(
-    about = "Stop demo services using runtime state.",
-    long_about = "Stops services recorded in state/pids for a tenant/team or all services when --all is set.",
-    after_help = "Main options:\n  (none)\n\nOptional options:\n  --tenant <TENANT> (default: demo)\n  --team <TEAM> (default: default)\n  --state-dir <PATH> (default: ./state or <bundle>/state)\n  --bundle <DIR> (legacy mode if --state-dir omitted)\n  --all\n  --verbose\n  --no-nats"
-)]
-struct DemoDownArgs {
-    #[arg(long)]
-    bundle: Option<PathBuf>,
-    #[arg(long, default_value = "demo")]
-    tenant: String,
-    #[arg(long, default_value = "default")]
-    team: String,
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
-    #[arg(long)]
-    all: bool,
-    #[arg(long)]
-    verbose: bool,
-    #[arg(long)]
-    no_nats: bool,
-}
-
 #[derive(Parser)]
 #[command(
     about = "Show demo service status using runtime state.",
@@ -1084,20 +1063,13 @@ impl DemoCommand {
         }
         match self.command {
             DemoSubcommand::Build(args) => args.run(ctx),
+            DemoSubcommand::Up(args) => args.run_start(ctx),
             DemoSubcommand::Start(args) => args.run_start(ctx),
-            DemoSubcommand::Up(args) => {
-                eprintln!("Warning: 'demo up' is deprecated; use 'demo start'.");
-                args.run(ctx)
-            }
             DemoSubcommand::Setup(args) => args.run(),
             DemoSubcommand::Send(args) => args.run(),
             DemoSubcommand::Receive(args) => args.run(),
+            DemoSubcommand::Ingress(args) => args.run(),
             DemoSubcommand::New(args) => args.run(),
-            DemoSubcommand::Stop(args) => args.run(),
-            DemoSubcommand::Down(args) => {
-                eprintln!("Warning: 'demo down' is deprecated; use 'demo stop'.");
-                args.run()
-            }
             DemoSubcommand::Status(args) => args.run(),
             DemoSubcommand::Logs(args) => args.run(),
             DemoSubcommand::Doctor(args) => args.run(ctx),
@@ -1573,14 +1545,10 @@ impl DemoBuildArgs {
 
 impl DemoUpArgs {
     fn run_start(self, ctx: &AppCtx) -> anyhow::Result<()> {
-        self.run_with_shutdown(ctx, true)
+        self.run_with_shutdown(ctx)
     }
 
-    fn run(self, ctx: &AppCtx) -> anyhow::Result<()> {
-        self.run_with_shutdown(ctx, false)
-    }
-
-    fn run_with_shutdown(self, ctx: &AppCtx, wait_for_ctrlc_flag: bool) -> anyhow::Result<()> {
+    fn run_with_shutdown(self, ctx: &AppCtx) -> anyhow::Result<()> {
         let restart: std::collections::BTreeSet<String> =
             self.restart.iter().map(restart_name).collect();
         let log_level = if self.quiet {
@@ -1590,11 +1558,8 @@ impl DemoUpArgs {
         } else {
             operator_log::Level::Info
         };
-        let command_label = if wait_for_ctrlc_flag {
-            "demo start"
-        } else {
-            "demo up"
-        };
+        let command_label = "demo start";
+        let debug_enabled = self.verbose;
         if let Some(bundle) = self.bundle.clone() {
             let state_dir = bundle.join("state");
             let log_dir = self.log_dir.clone().unwrap_or_else(|| bundle.join("logs"));
@@ -1621,7 +1586,7 @@ impl DemoUpArgs {
             }
             if demo_debug_enabled() {
                 println!(
-                    "[demo] up bundle={} tenant={:?} team={:?} nats_mode={:?} nats_url={:?} cloudflared={:?}",
+                    "[demo] start bundle={} tenant={:?} team={:?} nats_mode={:?} nats_url={:?} cloudflared={:?}",
                     bundle.display(),
                     self.tenant,
                     self.team,
@@ -1759,15 +1724,17 @@ impl DemoUpArgs {
                 cloudflared_config,
                 events_components,
                 &log_dir,
+                debug_enabled,
             );
             let mut ingress_server = None;
-            if wait_for_ctrlc_flag && result.is_ok() {
+            if result.is_ok() {
                 match start_demo_ingress_server(
                     &bundle,
                     &discovery,
                     &demo_config,
                     &domains_to_setup,
                     self.runner_binary.clone(),
+                    debug_enabled,
                 ) {
                     Ok(server) => {
                         println!(
@@ -1797,7 +1764,7 @@ impl DemoUpArgs {
                     format!("{command_label} bundle {} completed", bundle.display()),
                 );
             }
-            if wait_for_ctrlc_flag && result.is_ok() {
+            if result.is_ok() {
                 println!(
                     "{command_label} running (bundle={} tenant={} team={}); press Ctrl+C to stop",
                     bundle.display(),
@@ -1886,6 +1853,7 @@ impl DemoUpArgs {
             &restart,
             provider_options,
             &log_dir,
+            debug_enabled,
         );
         if let Err(ref err) = result {
             operator_log::error(
@@ -1895,7 +1863,7 @@ impl DemoUpArgs {
         } else {
             operator_log::info(module_path!(), "{command_label} services completed");
         }
-        if wait_for_ctrlc_flag && result.is_ok() {
+        if result.is_ok() {
             println!(
                 "{command_label} running (config={} tenant={} team={}); press Ctrl+C to stop",
                 config_path.display(),
@@ -2022,6 +1990,7 @@ impl DemoSendArgs {
             &discovery,
             self.runner_binary.clone(),
             secrets_gate::default_manager(),
+            false,
         )?;
         let context = OperatorContext {
             tenant: self.tenant.clone(),
@@ -2112,12 +2081,13 @@ impl DemoSendArgs {
 
 impl DemoReceiveArgs {
     fn run(self) -> anyhow::Result<()> {
-        let team = if self.team.is_empty() {
+        let team_context = if self.team.is_empty() {
             None
         } else {
-            Some(self.team.as_str())
+            Some(self.team.clone())
         };
-        let providers = discover_demo_messaging_providers(&self.bundle, &self.tenant, team)?;
+        let (providers, discovery) =
+            discover_demo_messaging_providers(&self.bundle, &self.tenant, team_context.as_deref())?;
         if providers.is_empty() {
             return Err(anyhow::anyhow!(
                 "no messaging providers found in bundle {}",
@@ -2130,7 +2100,7 @@ impl DemoReceiveArgs {
             .map(|info| info.provider_id.clone())
             .collect::<BTreeSet<_>>();
         let filter_active = self.provider.is_some();
-        let log_dir = resolve_log_dir(None, self.bundle.as_ref());
+        let log_dir = resolve_log_dir(None, Some(&self.bundle));
         std::fs::create_dir_all(&log_dir)?;
         let log_path = log_dir.join("incoming.log");
         println!("listening for inbound events via {}", log_path.display());
@@ -2142,10 +2112,333 @@ impl DemoReceiveArgs {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        let env_name = env::var("GREENTIC_ENV").unwrap_or_else(|_| "demo".to_string());
+        let domain = Domain::from(self.domain);
+        let subject_filter =
+            ingress_subject_filter(&env_name, &self.tenant, self.team.as_str(), domain);
+        let mut nats_urls = Vec::new();
+        if let Some(url) = self.nats_url.clone() {
+            nats_urls.push(url);
+        } else {
+            nats_urls.push(config::default_nats_url());
+        }
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let log_writer = Arc::new(Mutex::new(std::io::BufWriter::new(log_file)));
+        let runner_host = Arc::new(DemoRunnerHost::new(
+            self.bundle.clone(),
+            &discovery,
+            self.runner_binary.clone(),
+            secrets_gate::default_manager(),
+            false,
+        )?);
+        let context = OperatorContext {
+            tenant: self.tenant.clone(),
+            team: team_context.clone(),
+            correlation_id: None,
+        };
         let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(run_demo_receive_async(log_path, provider_ids, filter_active))?;
+        runtime.block_on(run_demo_receive_async(
+            nats_urls,
+            subject_filter,
+            provider_ids,
+            filter_active,
+            log_writer,
+            runner_host,
+            domain,
+            context,
+        ))?;
         Ok(())
     }
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Send a synthetic HTTP request through the messaging ingress pipeline.",
+    long_about = "Constructs an HttpInV1 payload, invokes the provider's ingest_http op, and optionally runs the resulting events through the app/outbound flow."
+)]
+struct DemoIngressArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long)]
+    provider: String,
+    #[arg(long)]
+    path: Option<String>,
+    #[arg(long, value_enum, default_value_t = DemoIngressMethod::Post)]
+    method: DemoIngressMethod,
+    #[arg(long = "header")]
+    headers: Vec<String>,
+    #[arg(long = "query")]
+    queries: Vec<String>,
+    #[arg(long)]
+    body: Option<String>,
+    #[arg(long)]
+    body_json: Option<String>,
+    #[arg(long)]
+    body_raw: Option<String>,
+    #[arg(long)]
+    binding_id: Option<String>,
+    #[arg(long, default_value = "demo")]
+    tenant: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+    #[arg(long)]
+    runner_binary: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "all")]
+    print: DemoIngressPrintMode,
+    #[arg(long)]
+    end_to_end: bool,
+    #[arg(long)]
+    app_pack: Option<String>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    send: bool,
+    #[arg(long)]
+    retries: Option<u32>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    dlq_tail: bool,
+    #[arg(long, default_value_t = true)]
+    dry_run: bool,
+    #[arg(long)]
+    correlation_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DemoIngressMethod {
+    Get,
+    Post,
+}
+
+impl DemoIngressMethod {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DemoIngressMethod::Get => "GET",
+            DemoIngressMethod::Post => "POST",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum DemoIngressPrintMode {
+    Http,
+    Events,
+    #[default]
+    All,
+}
+
+impl DemoIngressPrintMode {
+    fn should_print_http(&self) -> bool {
+        matches!(self, DemoIngressPrintMode::Http | DemoIngressPrintMode::All)
+    }
+
+    fn should_print_events(&self) -> bool {
+        matches!(
+            self,
+            DemoIngressPrintMode::Events | DemoIngressPrintMode::All
+        )
+    }
+}
+
+impl DemoIngressArgs {
+    fn run(self) -> anyhow::Result<()> {
+        ensure_single_body_field(&self)?;
+        let body_bytes = resolve_ingress_body(
+            self.body.as_deref(),
+            self.body_json.as_deref(),
+            self.body_raw.as_deref(),
+        )?;
+        let path = self
+            .path
+            .clone()
+            .unwrap_or_else(|| default_ingress_path(&self.provider, self.binding_id.as_deref()));
+        let headers = parse_header_pairs(&self.headers)?;
+        let queries = parse_query_pairs(&self.queries)?;
+        let route = derive_route_from_path(&path);
+        let full_path = if path.starts_with('/') {
+            path.clone()
+        } else {
+            format!("/{path}")
+        };
+
+        let request = crate::messaging_universal::ingress::build_ingress_request(
+            &self.provider,
+            route,
+            self.method.as_str(),
+            &full_path,
+            headers,
+            queries,
+            &body_bytes,
+            self.binding_id.clone(),
+            Some(self.tenant.clone()),
+            Some(self.team.clone()),
+        );
+
+        let team_context = if self.team.is_empty() {
+            None
+        } else {
+            Some(self.team.clone())
+        };
+        let context = OperatorContext {
+            tenant: self.tenant.clone(),
+            team: team_context,
+            correlation_id: self.correlation_id.clone(),
+        };
+
+        let (response, events) = crate::messaging_universal::ingress::run_ingress(
+            &self.bundle,
+            &self.provider,
+            &request,
+            &context,
+            self.runner_binary.clone(),
+            secrets_gate::default_manager(),
+        )?;
+
+        if self.print.should_print_http() {
+            print_http_response(&response)?;
+        }
+        if self.print.should_print_events() {
+            print_envelopes(&events)?;
+        }
+
+        if self.end_to_end {
+            crate::messaging_universal::egress::run_end_to_end(
+                events,
+                &self.provider,
+                &self.bundle,
+                &context,
+                self.runner_binary.clone(),
+                self.app_pack.clone(),
+                self.send,
+                self.dry_run,
+                self.retries.unwrap_or(0),
+                secrets_gate::default_manager(),
+            )?;
+        }
+
+        if self.dlq_tail {
+            let paths = RuntimePaths::new(self.bundle.join("state"), &self.tenant, &self.team);
+            println!("DLQ log location: {}", paths.dlq_log_path().display());
+        }
+        Ok(())
+    }
+}
+
+fn ensure_single_body_field(args: &DemoIngressArgs) -> anyhow::Result<()> {
+    let count =
+        args.body.is_some() as u8 + args.body_json.is_some() as u8 + args.body_raw.is_some() as u8;
+    if count > 1 {
+        Err(anyhow::anyhow!(
+            "only one of --body, --body-json, or --body-raw can be provided"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn resolve_ingress_body(
+    body: Option<&str>,
+    body_json: Option<&str>,
+    body_raw: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(raw) = body_raw {
+        return Ok(raw.as_bytes().to_vec());
+    }
+    if let Some(json) = body_json {
+        let _ = serde_json::from_str::<serde_json::Value>(json)
+            .with_context(|| "invalid JSON provided to --body-json")?;
+        return Ok(json.as_bytes().to_vec());
+    }
+    if let Some(path) = body {
+        let path = path.strip_prefix('@').unwrap_or(path);
+        let bytes =
+            std::fs::read(path).with_context(|| format!("failed to read body file at {}", path))?;
+        return Ok(bytes);
+    }
+    Ok(Vec::new())
+}
+
+fn parse_header_pairs(values: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    let mut headers = Vec::new();
+    for raw in values {
+        let score = raw.splitn(2, ':').collect::<Vec<_>>();
+        if score.len() != 2 {
+            return Err(anyhow::anyhow!(
+                "invalid header '{}'; expected 'Name: value'",
+                raw
+            ));
+        }
+        headers.push((score[0].trim().to_string(), score[1].trim().to_string()));
+    }
+    Ok(headers)
+}
+
+fn parse_query_pairs(values: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    let mut queries = Vec::new();
+    for raw in values {
+        let mut parts = raw.splitn(2, '=');
+        let key = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("invalid query '{}'; expected 'k=v'", raw))?;
+        let value = parts
+            .next()
+            .map(str::trim)
+            .ok_or_else(|| anyhow::anyhow!("invalid query '{}'; expected 'k=v'", raw))?;
+        queries.push((key.to_string(), value.to_string()));
+    }
+    Ok(queries)
+}
+
+fn default_ingress_path(provider: &str, binding_id: Option<&str>) -> String {
+    if let Some(binding) = binding_id {
+        format!("/ingress/{}/{}", provider, binding)
+    } else {
+        format!("/ingress/{}/webhook", provider)
+    }
+}
+
+fn derive_route_from_path(path: &str) -> Option<String> {
+    let segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() >= 3 && segments[1].eq_ignore_ascii_case("ingress") {
+        Some(segments[2].to_string())
+    } else {
+        None
+    }
+}
+
+fn print_http_response(
+    response: &crate::messaging_universal::dto::HttpOutV1,
+) -> anyhow::Result<()> {
+    println!("HTTP OUT: status {}", response.status);
+    for (name, value) in &response.headers {
+        println!("  {}: {}", name, value);
+    }
+    if let Some(body_b64) = &response.body_b64 {
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body_b64) {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                println!("  body: {}", text);
+            } else {
+                println!("  body (base64): {}", body_b64);
+            }
+        } else {
+            println!("  body (base64): {}", body_b64);
+        }
+    }
+    Ok(())
+}
+
+fn print_envelopes(envelopes: &[greentic_types::ChannelMessageEnvelope]) -> anyhow::Result<()> {
+    for envelope in envelopes {
+        let formatted = serde_json::to_string_pretty(envelope)?;
+        println!("{formatted}");
+    }
+    Ok(())
 }
 
 impl DemoNewArgs {
@@ -2181,7 +2474,7 @@ fn discover_demo_messaging_providers(
     bundle: &Path,
     tenant: &str,
     team: Option<&str>,
-) -> anyhow::Result<Vec<DemoProviderInfo>> {
+) -> anyhow::Result<(Vec<DemoProviderInfo>, discovery::DiscoveryResult)> {
     let is_demo_bundle = bundle.join("greentic.demo.yaml").exists();
     let mut packs = if is_demo_bundle {
         domains::discover_provider_packs_cbor_only(bundle, Domain::Messaging)?
@@ -2203,7 +2496,7 @@ fn discover_demo_messaging_providers(
             pack,
         })
         .collect();
-    Ok(entries)
+    Ok((entries, discovery))
 }
 
 fn select_demo_providers(
@@ -2264,6 +2557,7 @@ async fn connect_to_nats(urls: &[String]) -> anyhow::Result<(async_nats::Client,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_demo_receive_async(
     nats_urls: Vec<String>,
     subject_filter: String,
@@ -2500,6 +2794,7 @@ fn start_demo_ingress_server(
     demo_config: &config::DemoConfig,
     domains: &[Domain],
     runner_binary: Option<PathBuf>,
+    debug_enabled: bool,
 ) -> anyhow::Result<HttpIngressServer> {
     let addr = format!(
         "{}:{}",
@@ -2513,6 +2808,7 @@ fn start_demo_ingress_server(
         discovery,
         runner_binary,
         secrets_gate::default_manager(),
+        debug_enabled,
     )?);
     HttpIngressServer::start(HttpIngressConfig {
         bind_addr,
@@ -2573,22 +2869,6 @@ fn wait_for_ctrlc() -> anyhow::Result<()> {
             .await
             .map_err(|err| anyhow::anyhow!("failed to wait for Ctrl+C: {err}"))
     })
-}
-
-impl DemoDownArgs {
-    fn run(self) -> anyhow::Result<()> {
-        let state_dir = resolve_state_dir(self.state_dir, self.bundle.as_ref());
-        if demo_debug_enabled() {
-            println!(
-                "[demo] down state_dir={} tenant={} team={} all={}",
-                state_dir.display(),
-                self.tenant,
-                self.team,
-                self.all
-            );
-        }
-        demo::demo_down_runtime(&state_dir, &self.tenant, &self.team, self.all)
-    }
 }
 
 impl DemoStatusArgs {

@@ -62,6 +62,7 @@ services:
             continue_on_error: true,
         },
         &log_dir,
+        true,
     )
     .unwrap();
 

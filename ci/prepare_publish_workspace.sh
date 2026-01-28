@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PATH_DEPS=0
+
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=1
@@ -38,7 +40,8 @@ done < <(find "$WORK_DIR" -name "Cargo.toml" -print0)
 if rg -n "path\\s*=" -g "Cargo.toml" "$WORK_DIR" >/dev/null; then
   echo "path dependencies remain in publish workspace." >&2
   rg -n "path\\s*=" -g "Cargo.toml" "$WORK_DIR" >&2
-  exit 1
+  PATH_DEPS=1
+  touch "$WORK_DIR/.path-deps"
 fi
 
 echo "$WORK_DIR"

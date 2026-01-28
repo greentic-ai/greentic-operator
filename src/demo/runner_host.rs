@@ -60,14 +60,24 @@ pub struct DemoRunnerHost {
     catalog: HashMap<(Domain, String), ProviderPack>,
     _secrets_manager: DynSecretsManager,
     card_renderer: CardRenderer,
+    debug_enabled: bool,
 }
 
 impl DemoRunnerHost {
+    pub fn bundle_root(&self) -> &Path {
+        &self.bundle_root
+    }
+
+    pub fn secrets_manager(&self) -> DynSecretsManager {
+        self._secrets_manager.clone()
+    }
+
     pub fn new(
         bundle_root: PathBuf,
         discovery: &discovery::DiscoveryResult,
         runner_binary: Option<PathBuf>,
         secrets_manager: DynSecretsManager,
+        debug_enabled: bool,
     ) -> anyhow::Result<Self> {
         let runner_binary = runner_binary.and_then(validate_runner_binary);
         let mode = if let Some(ref binary) = runner_binary {
@@ -109,7 +119,12 @@ impl DemoRunnerHost {
             catalog,
             _secrets_manager: secrets_manager,
             card_renderer: CardRenderer::new(Tier::Premium),
+            debug_enabled,
         })
+    }
+
+    pub fn debug_enabled(&self) -> bool {
+        self.debug_enabled
     }
 
     pub fn supports_op(&self, domain: Domain, provider_type: &str, op_id: &str) -> bool {
@@ -139,6 +154,21 @@ impl DemoRunnerHost {
             })?;
 
         let flow_id = op_id;
+        if self.debug_enabled {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[demo dev] invoking provider domain={} provider={} flow={} tenant={} team={} payload_len={} preview={}",
+                    domains::domain_name(domain),
+                    provider_type,
+                    flow_id,
+                    ctx.tenant,
+                    ctx.team.as_deref().unwrap_or("default"),
+                    payload_bytes.len(),
+                    payload_preview(payload_bytes),
+                ),
+            );
+        }
         let run_dir = state_layout::run_dir(&self.bundle_root, domain, &pack.pack_id, flow_id)?;
         std::fs::create_dir_all(&run_dir)?;
 
@@ -174,6 +204,22 @@ impl DemoRunnerHost {
             )?,
         };
 
+        if self.debug_enabled {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[demo dev] provider={} flow={} tenant={} team={} success={} mode={:?} error={:?} corr_id={}",
+                    provider_type,
+                    flow_id,
+                    ctx.tenant,
+                    ctx.team.as_deref().unwrap_or("default"),
+                    outcome.success,
+                    outcome.mode,
+                    outcome.error,
+                    ctx.correlation_id.as_deref().unwrap_or("none"),
+                ),
+            );
+        }
         operator_log::info(
             module_path!(),
             format!(
@@ -220,6 +266,7 @@ impl DemoRunnerHost {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_with_runner_integration(
         &self,
         _domain: Domain,
@@ -329,4 +376,26 @@ fn runner_binary_is_executable(metadata: &fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn runner_binary_is_executable(_: &fs::Metadata) -> bool {
     true
+}
+
+fn payload_preview(bytes: &[u8]) -> String {
+    const MAX_PREVIEW: usize = 256;
+    if bytes.is_empty() {
+        return "<empty>".to_string();
+    }
+    let preview_len = bytes.len().min(MAX_PREVIEW);
+    if let Ok(text) = std::str::from_utf8(&bytes[..preview_len]) {
+        if bytes.len() <= MAX_PREVIEW {
+            text.to_string()
+        } else {
+            format!("{text}...")
+        }
+    } else {
+        let encoded = general_purpose::STANDARD.encode(&bytes[..preview_len]);
+        if bytes.len() <= MAX_PREVIEW {
+            encoded
+        } else {
+            format!("{encoded}...")
+        }
+    }
 }

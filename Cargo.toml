@@ -1,6 +1,6 @@
 [package]
 name = "greentic-operator"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2024"
 rust-version = "1.90"
 description = "Greentic operator CLI for local dev and demo orchestration."
@@ -10,7 +10,7 @@ repository = "https://github.com/greentic/greentic-operator"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-async-nats = "0.34"
+async-nats = "0.46"
 futures-util = "0.3"
 base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
@@ -24,7 +24,9 @@ sysinfo = "0.38"
 directories-next = "2"
 greentic-runner-desktop = { version = "0.4" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "signal", "net"] }
-hyper = { version = "0.14", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+hyper-util = "0.1"
 gsm-gateway = { version = "0.4" }
 gsm-egress = { version = "0.4" }
 gsm-subscriptions-teams = { version = "0.4" }
@@ -32,6 +34,9 @@ gsm-core = { version = "0.4" }
 messaging-cardkit = { path = "crates/messaging-cardkit" }
 rpassword = "7"
 greentic-secrets-lib = "0.4.14"
+greentic-types = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
 
 [dev-dependencies]
 tempfile = "3.10"

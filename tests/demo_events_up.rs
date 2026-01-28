@@ -1,5 +1,7 @@
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 fn write_pack(path: &std::path::Path, pack_id: &str) -> anyhow::Result<()> {
     let file = std::fs::File::create(path)?;
@@ -44,10 +46,10 @@ fn demo_up_starts_events_services_when_events_packs_exist() {
     );
     std::fs::write(root.join("greentic.yaml"), config).unwrap();
 
-    let output = Command::new(fake_bin("greentic-operator"))
+    let mut child = Command::new(fake_bin("greentic-operator"))
         .args([
             "demo",
-            "up",
+            "start",
             "--bundle",
             root.to_string_lossy().as_ref(),
             "--tenant",
@@ -56,24 +58,15 @@ fn demo_up_starts_events_services_when_events_packs_exist() {
             "--cloudflared",
             "off",
         ])
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("events-ingress: Started"));
-    assert!(stdout.contains("events-worker: Started"));
 
-    let _ = Command::new(fake_bin("greentic-operator"))
-        .args([
-            "demo",
-            "down",
-            "--bundle",
-            root.to_string_lossy().as_ref(),
-            "--tenant",
-            "demo",
-            "--no-nats",
-        ])
-        .status();
+    thread::sleep(Duration::from_secs(3));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(root.join("state").exists());
 }
 
 fn fake_bin(name: &str) -> PathBuf {

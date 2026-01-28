@@ -1,17 +1,22 @@
 use std::{convert::Infallible, net::SocketAddr, sync::Arc, thread};
 
 use anyhow::{Context, Result};
+use http_body_util::{BodyExt, Full};
 use hyper::{
-    Body, Method, Request, Response, Server, StatusCode,
-    body::to_bytes,
-    header::CONTENT_TYPE,
-    service::{make_service_fn, service_fn},
+    Method, Request, Response, StatusCode,
+    body::{Bytes, Incoming},
+    header::{CONTENT_TYPE, HeaderName, HeaderValue},
+    server::conn::http1::Builder as Http1Builder,
+    service::service_fn,
 };
+use hyper_util::rt::tokio::TokioIo;
 use serde_json::json;
-use tokio::{runtime::Runtime, sync::oneshot};
+use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 
-use crate::demo::runner_host::{DemoRunnerHost, FlowOutcome, OperatorContext};
-use crate::domains::Domain;
+use crate::demo::runner_host::{DemoRunnerHost, OperatorContext};
+use crate::domains::{self, Domain};
+use crate::messaging_universal::dto::HttpOutV1;
+use crate::messaging_universal::ingress::{build_ingress_request, run_ingress};
 use crate::operator_log;
 
 #[derive(Clone)]
@@ -28,9 +33,12 @@ pub struct HttpIngressServer {
 
 impl HttpIngressServer {
     pub fn start(config: HttpIngressConfig) -> Result<Self> {
+        let debug_enabled = config.runner_host.debug_enabled();
+        let domains = config.domains;
+        let runner_host = config.runner_host;
         let state = Arc::new(HttpIngressState {
-            runner_host: config.runner_host,
-            domains: config.domains,
+            runner_host,
+            domains,
         });
         let (tx, rx) = oneshot::channel();
         let addr = config.bind_addr;
@@ -39,24 +47,63 @@ impl HttpIngressServer {
             .spawn(move || -> Result<()> {
                 let runtime = Runtime::new().context("failed to create ingress runtime")?;
                 runtime.block_on(async move {
-                    let service = make_service_fn(move |_| {
-                        let state = state.clone();
-                        async move {
-                            Ok::<_, Infallible>(service_fn(move |req| {
-                                handle_request(req, state.clone())
-                            }))
-                        }
-                    });
+                    let listener = TcpListener::bind(addr)
+                        .await
+                        .context("failed to bind ingress listener")?;
                     operator_log::info(
                         module_path!(),
                         format!("demo ingress listening on http://{}", addr),
                     );
-                    let server = Server::try_bind(&addr)?.serve(service);
-                    server
-                        .with_graceful_shutdown(async move {
-                            let _ = rx.await;
-                        })
-                        .await?;
+                    if debug_enabled {
+                        let domain_list = state
+                            .domains
+                            .iter()
+                            .map(|domain| domains::domain_name(*domain))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        operator_log::debug(
+                            module_path!(),
+                            format!(
+                                "[demo dev] ingress server bound={} domains={}",
+                                addr, domain_list
+                            ),
+                        );
+                    }
+                    let mut shutdown = rx;
+                    loop {
+                        tokio::select! {
+                            _ = &mut shutdown => break,
+                            accept = listener.accept() => match accept {
+                                Ok((stream, _peer)) => {
+                                    let connection_state = state.clone();
+                                    tokio::spawn(async move {
+                                        let service = service_fn(move |req| {
+                                            handle_request(req, connection_state.clone())
+                                        });
+                                        let http = Http1Builder::new();
+                                        let stream = TokioIo::new(stream);
+                                        if let Err(err) = http
+                                            .serve_connection(stream, service)
+                                            .await
+                                        {
+                                            operator_log::error(
+                                                module_path!(),
+                                                format!(
+                                                    "demo ingress connection error: {err}"
+                                                ),
+                                            );
+                                        }
+                                    });
+                                }
+                                Err(err) => {
+                                    operator_log::error(
+                                        module_path!(),
+                                        format!("demo ingress accept error: {err}"),
+                                    );
+                                }
+                            },
+                        }
+                    }
                     Ok(())
                 })
             })?;
@@ -87,9 +134,9 @@ struct HttpIngressState {
 }
 
 async fn handle_request(
-    req: Request<Body>,
+    req: Request<Incoming>,
     state: Arc<HttpIngressState>,
-) -> Result<Response<Body>, Infallible> {
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let response = match handle_request_inner(req, state).await {
         Ok(response) => response,
         Err(response) => response,
@@ -98,15 +145,17 @@ async fn handle_request(
 }
 
 async fn handle_request_inner(
-    req: Request<Body>,
+    req: Request<Incoming>,
     state: Arc<HttpIngressState>,
-) -> Result<Response<Body>, Response<Body>> {
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     if req.method() != Method::POST && req.method() != Method::GET {
         return Err(error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "only GET/POST allowed",
         ));
     }
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
     let segments = req
         .uri()
         .path()
@@ -134,68 +183,153 @@ async fn handle_request_inner(
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
         .unwrap_or_else(|| "default".to_string());
-    let flow_id = if state
+    if !state
         .runner_host
-        .supports_op(domain, &provider, "handle-webhook")
+        .supports_op(domain, &provider, "ingest_http")
     {
-        "handle-webhook".to_string()
-    } else if state.runner_host.supports_op(domain, &provider, "ingest") {
-        "ingest".to_string()
-    } else {
         return Err(error_response(
             StatusCode::NOT_FOUND,
             "no ingress flow available",
         ));
-    };
+    }
+
     let correlation_id = req
         .headers()
         .get("x-correlation-id")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
-    let payload_bytes = to_bytes(req.into_body()).await.unwrap_or_default();
+    let headers = collect_headers(req.headers());
+    let queries = collect_queries(req.uri().query());
+    let payload_bytes = req
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .unwrap_or_default();
+
+    let request = build_ingress_request(
+        &provider,
+        None,
+        method.as_str(),
+        &path,
+        headers,
+        queries,
+        &payload_bytes,
+        None,
+        Some(tenant.clone()),
+        Some(team.clone()),
+    );
+
     let context = OperatorContext {
-        tenant,
-        team: Some(team),
-        correlation_id,
+        tenant: tenant.clone(),
+        team: Some(team.clone()),
+        correlation_id: correlation_id.clone(),
     };
-    let runner_host = state.runner_host.clone();
-    let provider_for_exec = provider.clone();
-    let flow_for_exec = flow_id.clone();
-    let payload_for_exec = payload_bytes.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        runner_host.invoke_provider_op(
-            domain,
-            &provider_for_exec,
-            &flow_for_exec,
-            &payload_for_exec,
-            &context,
-        )
-    })
-    .await
-    .map_err(|err| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("ingress invocation panicked: {err}"),
-        )
-    })?
+    let debug_enabled = state.runner_host.debug_enabled();
+    if debug_enabled {
+        operator_log::debug(
+            module_path!(),
+            format!(
+                "[demo dev] ingress request method={} path={} domain={} provider={} tenant={} team={} corr_id={:?} payload_len={}",
+                method,
+                path,
+                domains::domain_name(domain),
+                provider,
+                context.tenant,
+                context.team.as_deref().unwrap_or("default"),
+                context.correlation_id.as_deref().unwrap_or("none"),
+                payload_bytes.len(),
+            ),
+        );
+    }
+
+    let (response, events) = run_ingress(
+        state.runner_host.bundle_root(),
+        &provider,
+        &request,
+        &context,
+        None,
+        state.runner_host.secrets_manager(),
+    )
     .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
-    let body = flow_outcome_body(&outcome);
-    let status = if outcome.success {
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
-    Ok(json_response(status, body))
+    if !events.is_empty() {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[demo ingress] parsed {} event(s) from provider={} tenant={} team={}",
+                events.len(),
+                provider,
+                tenant,
+                team
+            ),
+        );
+    }
+
+    if debug_enabled {
+        operator_log::debug(
+            module_path!(),
+            format!(
+                "[demo dev] ingress outcome domain={} provider={} tenant={} team={} corr_id={:?} events={}",
+                domains::domain_name(domain),
+                provider,
+                context.tenant,
+                context.team.as_deref().unwrap_or("default"),
+                correlation_id.as_deref().unwrap_or("none"),
+                events.len(),
+            ),
+        );
+    }
+
+    build_http_response(&response)
+        .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
 }
 
-fn flow_outcome_body(outcome: &FlowOutcome) -> serde_json::Value {
-    json!({
-        "success": outcome.success,
-        "mode": format!("{:?}", outcome.mode),
-        "output": outcome.output,
-        "raw": outcome.raw,
-        "error": outcome.error,
-    })
+fn build_http_response(response: &HttpOutV1) -> Result<Response<Full<Bytes>>, String> {
+    let mut builder = Response::builder().status(response.status);
+    builder = builder.header(CONTENT_TYPE, "application/json");
+    for (name, value) in &response.headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(header_name, header_value);
+        }
+    }
+    let body = serde_json::to_string(response).map_err(|err| err.to_string())?;
+    builder
+        .body(Full::from(Bytes::from(body)))
+        .map_err(|err| err.to_string())
+}
+
+fn collect_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn collect_queries(query: Option<&str>) -> Vec<(String, String)> {
+    query
+        .map(|value| {
+            value
+                .split('&')
+                .filter_map(|pair| {
+                    let mut pieces = pair.splitn(2, '=');
+                    let key = pieces.next()?.trim();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    let value = pieces.next().unwrap_or("").trim();
+                    Some((key.to_string(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_domain(value: &str) -> Option<Domain> {
@@ -207,7 +341,7 @@ fn parse_domain(value: &str) -> Option<Domain> {
     }
 }
 
-fn error_response(status: StatusCode, message: impl Into<String>) -> Response<Body> {
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response<Full<Bytes>> {
     let body = json!({
         "success": false,
         "message": message.into()
@@ -215,16 +349,18 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response<Bo
     json_response(status, body)
 }
 
-fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Body> {
+fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Full<Bytes>> {
     let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
+        .body(Full::from(Bytes::from(body)))
         .unwrap_or_else(|err| {
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(format!("failed to build response: {err}")))
+                .body(Full::from(Bytes::from(format!(
+                    "failed to build response: {err}"
+                ))))
                 .unwrap()
         })
 }

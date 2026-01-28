@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod domains;
 pub mod gmap;
+pub mod messaging_universal;
 pub mod operator_log;
 pub mod project;
 pub mod providers;

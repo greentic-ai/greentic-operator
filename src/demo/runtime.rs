@@ -93,6 +93,44 @@ impl<'a> ServiceTracker<'a> {
     }
 }
 
+fn log_service_spec_debug(
+    service_id: &str,
+    kind: &str,
+    spec: &supervisor::ServiceSpec,
+    tenant: &str,
+    team: &str,
+    debug_enabled: bool,
+) {
+    if !debug_enabled {
+        return;
+    }
+    let cwd = spec
+        .cwd
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unset>".to_string());
+    let argv = spec.argv.join(" ");
+    let env_pairs = spec
+        .env
+        .iter()
+        .map(|(key, value)| format!("{}={}", key, value))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let env_display = if env_pairs.is_empty() {
+        "<empty>".to_string()
+    } else {
+        env_pairs
+    };
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[demo dev] service {} kind={} tenant={} team={} cwd={} argv=\"{}\" env={}",
+            service_id, kind, tenant, team, cwd, argv, env_display
+        ),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_supervised_service(
     service_id: &str,
     kind: &str,
@@ -101,8 +139,12 @@ fn spawn_supervised_service(
     paths: &RuntimePaths,
     restart: &BTreeSet<String>,
     tracker: &mut ServiceTracker,
+    tenant: &str,
+    team: &str,
+    debug_enabled: bool,
 ) -> anyhow::Result<ServiceSummary> {
     let log_path = operator_log::reserve_service_log(log_dir, service_id)?;
+    log_service_spec_debug(service_id, kind, spec, tenant, team, debug_enabled);
     let handle = spawn_if_needed(paths, spec, restart, Some(log_path.clone()))?;
     let pid = if let Some(handle) = &handle {
         Some(handle.pid)
@@ -138,6 +180,7 @@ fn print_service_summary(summaries: &[ServiceSummary]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_embedded_messaging(
     bundle_root: &Path,
     tenant: &str,
@@ -146,6 +189,7 @@ fn spawn_embedded_messaging(
     log_dir: &Path,
     restart: &BTreeSet<String>,
     tracker: &mut ServiceTracker,
+    debug_enabled: bool,
 ) -> anyhow::Result<ServiceSummary> {
     let exe = std::env::current_exe()?;
     let mut args = vec![
@@ -173,6 +217,9 @@ fn spawn_embedded_messaging(
         tracker.paths,
         restart,
         tracker,
+        tenant,
+        team,
+        debug_enabled,
     )?;
     summary.add_detail(format!("tenant={tenant} team={team}"));
     summary.add_detail(format!(
@@ -242,6 +289,7 @@ pub enum NatsMode {
     External,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn demo_up(
     bundle_root: &Path,
     tenant: &str,
@@ -252,6 +300,7 @@ pub fn demo_up(
     cloudflared: Option<CloudflaredConfig>,
     events_components: Vec<crate::services::ComponentSpec>,
     log_dir: &Path,
+    debug_enabled: bool,
 ) -> anyhow::Result<()> {
     let team_id = team.unwrap_or("default");
     let state_dir = bundle_root.join("state");
@@ -260,6 +309,20 @@ pub fn demo_up(
     let mut service_summaries = Vec::new();
     let restart_targets = BTreeSet::new();
     let mut public_base_url: Option<String> = None;
+    if debug_enabled {
+        let component_ids = events_components
+            .iter()
+            .map(|component| component.id.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+        operator_log::debug(
+            module_path!(),
+            format!(
+                "[demo dev] demo_up tenant={} team={} nats_mode={:?} messaging_enabled={} events_components=[{}]",
+                tenant, team_id, nats_mode, messaging_enabled, component_ids
+            ),
+        );
+    }
     if let Some(config) = cloudflared {
         let cloudflared_log = operator_log::reserve_service_log(log_dir, "cloudflared")
             .with_context(|| "unable to open cloudflared.log")?;
@@ -280,6 +343,18 @@ pub fn demo_up(
                 handle.log_path.display()
             ),
         );
+        if debug_enabled {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[demo dev] tenant={} team={} cloudflared url={} log={}",
+                    tenant,
+                    team_id,
+                    handle.url,
+                    handle.log_path.display()
+                ),
+            );
+        }
         let url = handle.url.clone();
         let log_path = handle.log_path.clone();
         service_tracker.record_with_log("cloudflared", "cloudflared", Some(&log_path))?;
@@ -310,6 +385,18 @@ pub fn demo_up(
                             module_path!(),
                             format!("nats started state={:?} log={}", state, nats_log.display()),
                         );
+                        if debug_enabled {
+                            operator_log::debug(
+                                module_path!(),
+                                format!(
+                                    "[demo dev] tenant={} team={} nats state={:?} log={}",
+                                    tenant,
+                                    team_id,
+                                    state,
+                                    nats_log.display()
+                                ),
+                            );
+                        }
                         service_tracker
                             .record_with_log("nats", "nats", Some(&nats_log))
                             .with_context(|| "failed to record nats service state")?;
@@ -346,6 +433,15 @@ pub fn demo_up(
             resolved_nats_url.as_deref(),
             public_base_url.as_deref(),
         );
+        if debug_enabled {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[demo dev] launching GSM gateway/egress/subscriptions tenant={} team={} envs={:?}",
+                    tenant, team_id, env_map
+                ),
+            );
+        }
         let mut messaging_summary = spawn_embedded_messaging(
             bundle_root,
             tenant,
@@ -354,6 +450,7 @@ pub fn demo_up(
             log_dir,
             &restart_targets,
             &mut service_tracker,
+            debug_enabled,
         )?;
         messaging_summary.add_detail("embedded messaging stack".to_string());
         service_summaries.push(messaging_summary);
@@ -364,6 +461,15 @@ pub fn demo_up(
     if !events_components.is_empty() && resolved_nats_url.is_some() {
         let envs = build_env_kv(tenant, team, resolved_nats_url.as_deref());
         for component in events_components {
+            if debug_enabled {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[demo dev] starting event component id={} binary={} args={:?} envs={:?}",
+                        component.id, component.binary, component.args, envs
+                    ),
+                );
+            }
             let state = services::start_component(bundle_root, &component, &envs)?;
             println!("{}: {:?}", component.id, state);
             let log_path = paths.log_path(&component.id);
@@ -386,6 +492,15 @@ pub fn demo_up(
             module_path!(),
             "demo running in embedded runner mode; gateway/egress disabled",
         );
+        if debug_enabled {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[demo dev] embedded runner mode only tenant={} team={} (gateway/egress/subscriptions skipped)",
+                    tenant, team_id
+                ),
+            );
+        }
     }
 
     Ok(())
@@ -407,6 +522,7 @@ fn build_env_kv(
     envs
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn demo_up_services(
     config_path: &Path,
     config: &DemoConfig,
@@ -415,6 +531,7 @@ pub fn demo_up_services(
     restart: &BTreeSet<String>,
     provider_options: crate::providers::ProviderSetupOptions,
     log_dir: &Path,
+    debug_enabled: bool,
 ) -> anyhow::Result<()> {
     let config_dir = config_path
         .parent()
@@ -429,13 +546,24 @@ pub fn demo_up_services(
     operator_log::info(
         module_path!(),
         format!(
-            "demo up services start bundle={} tenant={} team={} log_dir={}",
+            "demo start services start bundle={} tenant={} team={} log_dir={}",
             config_path.display(),
             tenant,
             team,
             log_dir.display()
         ),
     );
+    if debug_enabled {
+        operator_log::debug(
+            module_path!(),
+            format!(
+                "[demo verbose] bundle={} tenant={} team={} logging=debug",
+                config_path.display(),
+                tenant,
+                team
+            ),
+        );
+    }
 
     if should_restart(restart, "cloudflared") {
         let _ = supervisor::stop_pidfile(&paths.pid_path("cloudflared"), 2_000);
@@ -470,6 +598,19 @@ pub fn demo_up_services(
                 handle.log_path.display()
             ),
         );
+        if debug_enabled {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[demo dev] tenant={} team={} cloudflared domains={} url={} log={}",
+                    tenant,
+                    team,
+                    domain_list,
+                    handle.url,
+                    handle.log_path.display()
+                ),
+            );
+        }
         println!(
             "Public URL (service=cloudflared domains={domain_list}): {}",
             handle.url
@@ -494,6 +635,7 @@ pub fn demo_up_services(
                 &config.services.nats.spawn.args,
                 &build_env(tenant, team, None, public_base_url.as_deref()),
             )?;
+            log_service_spec_debug("nats", "nats", &spec, tenant, team, debug_enabled);
             let nats_log = operator_log::reserve_service_log(log_dir, "nats")
                 .with_context(|| "unable to open nats.log")?;
             if let Some(handle) = spawn_if_needed(&paths, &spec, restart, Some(nats_log.clone()))? {
@@ -751,16 +893,20 @@ pub fn demo_down_runtime(
 }
 
 fn select_log_path(log_dir: &Path, service: &str, tenant: &str, tenant_log: &Path) -> PathBuf {
-    let mut candidates = Vec::new();
-    candidates.push(tenant_log.to_path_buf());
-    candidates.push(log_dir.join(format!("{service}.log")));
-    candidates.push(log_dir.join(format!("{service}-{tenant}.log")));
-    candidates.push(log_dir.join(format!("{service}.{tenant}.log")));
+    let candidates = [
+        log_dir.join(format!("{service}.log")),
+        log_dir.join(format!("{service}-{tenant}.log")),
+        log_dir.join(format!("{service}.{tenant}.log")),
+    ];
     for candidate in &candidates {
         if candidate.exists() {
             return candidate.clone();
         }
     }
+    if tenant_log.exists() {
+        return tenant_log.to_path_buf();
+    }
+    let _ = ensure_log_file(tenant_log);
     tenant_log.to_path_buf()
 }
 
@@ -925,12 +1071,13 @@ mod tests {
     }
 
     #[test]
-    fn select_log_path_prefers_existing() -> anyhow::Result<()> {
+    fn select_log_path_prefers_service_log_when_present() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let tenant_path = tenant_log_path(dir.path(), "messaging", "demo", "default")?;
-        fs::write(dir.path().join("messaging.log"), "other")?;
+        let service_path = dir.path().join("messaging.log");
+        fs::write(&service_path, "other")?;
         let selected = select_log_path(dir.path(), "messaging", "demo", &tenant_path);
-        assert_eq!(selected, tenant_path);
+        assert_eq!(selected, service_path);
         Ok(())
     }
 
