@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,8 +15,13 @@ use crate::services;
 use crate::supervisor;
 
 use crate::cloudflared::{self, CloudflaredConfig};
-use crate::config::DemoConfig;
+use crate::config::{DemoConfig, DemoSubscriptionsMode};
 use crate::dev_mode::DevSettingsResolved;
+
+use crate::subscriptions_universal::{
+    build_runner, ensure_desired_subscriptions, scheduler::Scheduler, service::SubscriptionService,
+    state_root, store::SubscriptionStore,
+};
 
 struct ServiceSummary {
     id: String,
@@ -226,6 +233,91 @@ fn spawn_embedded_messaging(
         "cmd=dev embedded --project-root {}",
         bundle_root.display()
     ));
+    Ok(summary)
+}
+
+fn spawn_universal_subscriptions_service(
+    bundle_root: &Path,
+    config: &DemoConfig,
+    tenant: &str,
+    team: &str,
+    tracker: &mut ServiceTracker,
+    log_dir: &Path,
+    debug_enabled: bool,
+) -> anyhow::Result<ServiceSummary> {
+    let team_override = if team.trim().is_empty() {
+        None
+    } else {
+        Some(team.to_string())
+    };
+    let log_path = operator_log::reserve_service_log(log_dir, "subscriptions")
+        .with_context(|| "unable to open subscriptions log file")?;
+    tracker.record_with_log("subscriptions-universal", "subscriptions", Some(&log_path))?;
+
+    let desired = &config.services.subscriptions.universal.desired;
+    let (runner_host, context) = build_runner(bundle_root, tenant, team_override.clone())?;
+    let store = SubscriptionStore::new(state_root(bundle_root));
+    let scheduler = Scheduler::new(SubscriptionService::new(runner_host, context), store);
+
+    ensure_desired_subscriptions(
+        bundle_root,
+        tenant,
+        team_override.clone(),
+        desired,
+        &scheduler,
+    )?;
+
+    let renew_interval_secs = config
+        .services
+        .subscriptions
+        .universal
+        .renew_interval_seconds
+        .max(1);
+    let renew_skew_secs = config
+        .services
+        .subscriptions
+        .universal
+        .renew_skew_minutes
+        .max(1)
+        .saturating_mul(60);
+    let interval = Duration::from_secs(renew_interval_secs);
+    let skew = Duration::from_secs(renew_skew_secs);
+
+    let scheduler_handle = scheduler;
+    thread::Builder::new()
+        .name("subscriptions-universal".to_string())
+        .spawn(move || {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "subscriptions-universal scheduler running interval={}s skew={}s",
+                    renew_interval_secs, renew_skew_secs
+                ),
+            );
+            loop {
+                std::thread::sleep(interval);
+                if let Err(err) = scheduler_handle.renew_due(skew) {
+                    operator_log::error(
+                        module_path!(),
+                        format!("subscriptions-universal renew failed err={}", err),
+                    );
+                }
+            }
+        })?;
+
+    let mut summary = ServiceSummary::new("subscriptions-universal", None);
+    summary.add_detail(format!("log={}", log_path.display()));
+    summary.add_detail(format!("renew_interval={}s", renew_interval_secs));
+    summary.add_detail("mode=universal".to_string());
+    if debug_enabled {
+        operator_log::debug(
+            module_path!(),
+            format!(
+                "[demo dev] tenant={} team={} universal subscriptions running",
+                tenant, team
+            ),
+        );
+    }
     Ok(summary)
 }
 
@@ -720,32 +812,47 @@ pub fn demo_up_services(
         service_tracker.record_with_log("egress", "egress", Some(&handle.log_path))?;
     }
 
-    if config.services.subscriptions.msgraph.enabled {
-        if should_restart(restart, "subscriptions") || should_restart(restart, "msgraph") {
-            let _ = supervisor::stop_pidfile(&paths.pid_path("subscriptions"), 2_000);
+    match config.services.subscriptions.mode {
+        DemoSubscriptionsMode::LegacyGsm => {
+            if config.services.subscriptions.msgraph.enabled {
+                if should_restart(restart, "subscriptions") || should_restart(restart, "msgraph") {
+                    let _ = supervisor::stop_pidfile(&paths.pid_path("subscriptions"), 2_000);
+                }
+                let mut args = config.services.subscriptions.msgraph.args.clone();
+                if !config.services.subscriptions.msgraph.mode.is_empty() {
+                    args.insert(0, config.services.subscriptions.msgraph.mode.clone());
+                }
+                let spec = build_service_spec(
+                    config_dir,
+                    dev_settings.as_ref(),
+                    "subscriptions",
+                    &config.services.subscriptions.msgraph.binary,
+                    &args,
+                    &build_env(
+                        tenant,
+                        team,
+                        nats_url.as_deref(),
+                        public_base_url.as_deref(),
+                    ),
+                )?;
+                if let Some(handle) = spawn_if_needed(&paths, &spec, restart, None)? {
+                    service_tracker.record_with_log(
+                        "subscriptions",
+                        "subscriptions",
+                        Some(&handle.log_path),
+                    )?;
+                }
+            }
         }
-        let mut args = config.services.subscriptions.msgraph.args.clone();
-        if !config.services.subscriptions.msgraph.mode.is_empty() {
-            args.insert(0, config.services.subscriptions.msgraph.mode.clone());
-        }
-        let spec = build_service_spec(
-            config_dir,
-            dev_settings.as_ref(),
-            "subscriptions",
-            &config.services.subscriptions.msgraph.binary,
-            &args,
-            &build_env(
+        DemoSubscriptionsMode::UniversalOps => {
+            spawn_universal_subscriptions_service(
+                config_dir,
+                config,
                 tenant,
                 team,
-                nats_url.as_deref(),
-                public_base_url.as_deref(),
-            ),
-        )?;
-        if let Some(handle) = spawn_if_needed(&paths, &spec, restart, None)? {
-            service_tracker.record_with_log(
-                "subscriptions",
-                "subscriptions",
-                Some(&handle.log_path),
+                &mut service_tracker,
+                log_dir,
+                debug_enabled,
             )?;
         }
     }

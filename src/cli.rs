@@ -7,8 +7,8 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Context;
-use chrono::Utc;
+use anyhow::{Context, anyhow};
+use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
@@ -40,6 +40,15 @@ use crate::secrets_gate::{self, DynSecretsManager};
 use crate::settings;
 use crate::setup_input::{SetupInputAnswers, collect_setup_answers, load_setup_input};
 use crate::state_layout;
+use crate::subscriptions_universal::{
+    build_runner,
+    scheduler::Scheduler,
+    service::{SubscriptionEnsureRequest, SubscriptionService},
+    state_root,
+    store::{AuthUserRefV1, SubscriptionStore},
+};
+use std::time::Duration;
+use uuid::Uuid;
 
 mod dev_mode_cmd;
 mod dev_secrets;
@@ -127,6 +136,8 @@ enum DemoSubcommand {
     Allow(DemoPolicyArgs),
     #[command(about = "Forbid a tenant/team access to a pack/flow/node")]
     Forbid(DemoPolicyArgs),
+    #[command(about = "Manage demo subscriptions via provider components")]
+    Subscriptions(DemoSubscriptionsCommand),
 }
 
 #[derive(Parser)]
@@ -914,6 +925,371 @@ struct DemoReceiveArgs {
 
 #[derive(Parser)]
 #[command(
+    about = "Manage demo subscriptions via provider components.",
+    long_about = "Ensure, renew, or delete provider-managed subscriptions from a demo bundle."
+)]
+struct DemoSubscriptionsCommand {
+    #[command(subcommand)]
+    command: DemoSubscriptionsSubcommand,
+}
+
+#[derive(Subcommand)]
+enum DemoSubscriptionsSubcommand {
+    Ensure(DemoSubscriptionsEnsureArgs),
+    Status(DemoSubscriptionsStatusArgs),
+    Renew(DemoSubscriptionsRenewArgs),
+    Delete(DemoSubscriptionsDeleteArgs),
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Ensure a subscription binding via a demo provider.",
+    long_about = "Invokes the provider's subscription_ensure flow, persists the binding state, and returns the binding_id."
+)]
+struct DemoSubscriptionsEnsureArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long)]
+    provider: String,
+    #[arg(long, default_value = "demo")]
+    tenant: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+    #[arg(long)]
+    binding_id: Option<String>,
+    #[arg(long)]
+    resource: Option<String>,
+    #[arg(long = "change-type", action = ArgAction::Append)]
+    change_types: Vec<String>,
+    #[arg(long)]
+    notification_url: Option<String>,
+    #[arg(long)]
+    client_state: Option<String>,
+    #[arg(long)]
+    user_id: Option<String>,
+    #[arg(long)]
+    user_token_key: Option<String>,
+}
+
+#[derive(Parser)]
+#[command(
+    about = "List demo subscription bindings persisted by the operator.",
+    long_about = "Prints provider/tenant/team/binding info for demo-managed subscriptions."
+)]
+struct DemoSubscriptionsStatusArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    binding_id: Option<String>,
+    #[arg(long, default_value = "demo")]
+    tenant: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Renew stored subscriptions that are near expiry.",
+    long_about = "Runs the scheduler to renew eligible bindings or a single binding if --binding-id is provided."
+)]
+struct DemoSubscriptionsRenewArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long)]
+    binding_id: Option<String>,
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long, default_value = "demo")]
+    tenant: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+    #[arg(long, default_value = "10")]
+    skew_minutes: u64,
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Delete a persisted demo subscription binding through the provider.",
+    long_about = "Invokes subscription_delete for the binding and removes the stored state file."
+)]
+struct DemoSubscriptionsDeleteArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long)]
+    binding_id: String,
+    #[arg(long)]
+    provider: String,
+    #[arg(long, default_value = "demo")]
+    tenant: String,
+    #[arg(long, default_value = "default")]
+    team: String,
+}
+
+impl DemoSubscriptionsCommand {
+    fn run(self) -> anyhow::Result<()> {
+        match self.command {
+            DemoSubscriptionsSubcommand::Ensure(args) => args.run(),
+            DemoSubscriptionsSubcommand::Status(args) => args.run(),
+            DemoSubscriptionsSubcommand::Renew(args) => args.run(),
+            DemoSubscriptionsSubcommand::Delete(args) => args.run(),
+        }
+    }
+}
+
+impl DemoSubscriptionsEnsureArgs {
+    fn run(self) -> anyhow::Result<()> {
+        let DemoSubscriptionsEnsureArgs {
+            bundle,
+            provider,
+            tenant,
+            team,
+            binding_id,
+            resource,
+            change_types,
+            notification_url,
+            client_state,
+            user_id,
+            user_token_key,
+        } = self;
+
+        let team_override = if team.trim().is_empty() {
+            None
+        } else {
+            Some(team)
+        };
+
+        domains::ensure_cbor_packs(&bundle)?;
+        let pack = resolve_demo_provider_pack(
+            &bundle,
+            &tenant,
+            team_override.as_deref(),
+            &provider,
+            Domain::Messaging,
+        )?;
+        let discovery = discovery::discover_with_options(
+            &bundle,
+            discovery::DiscoveryOptions { cbor_only: true },
+        )?;
+        let provider_map = discovery_map(&discovery.providers);
+        let provider_id = provider_id_for_pack(&pack.path, &pack.pack_id, Some(&provider_map));
+
+        let runner_host = DemoRunnerHost::new(
+            bundle.clone(),
+            &discovery,
+            None,
+            secrets_gate::default_manager(),
+            false,
+        )?;
+        let context = OperatorContext {
+            tenant: tenant.clone(),
+            team: team_override.clone(),
+            correlation_id: None,
+        };
+        let service = SubscriptionService::new(runner_host, context);
+
+        let binding_id = binding_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let request = build_subscription_request(
+            &binding_id,
+            resource,
+            change_types,
+            notification_url,
+            client_state,
+            user_id,
+            user_token_key,
+        );
+        let state = service.ensure_once(&provider_id, &request)?;
+
+        let store = SubscriptionStore::new(state_root(&bundle));
+        store.write_state(&state)?;
+        let state_path = store.state_path(
+            &state.provider,
+            &state.tenant,
+            state.team.as_deref(),
+            &state.binding_id,
+        );
+        println!(
+            "subscription binding {} persisted to {}",
+            state.binding_id,
+            state_path.display()
+        );
+        Ok(())
+    }
+}
+
+fn build_subscription_request(
+    binding_id: &str,
+    resource: Option<String>,
+    change_types: Vec<String>,
+    notification_url: Option<String>,
+    client_state: Option<String>,
+    user_id: Option<String>,
+    user_token_key: Option<String>,
+) -> SubscriptionEnsureRequest {
+    let change_types = if change_types.is_empty() {
+        vec!["created".to_string()]
+    } else {
+        change_types
+    };
+    let user = match (user_id, user_token_key) {
+        (Some(user_id), Some(token_key)) => Some(AuthUserRefV1 {
+            user_id,
+            token_key,
+            tenant_id: None,
+            email: None,
+            display_name: None,
+        }),
+        _ => None,
+    };
+    SubscriptionEnsureRequest {
+        binding_id: binding_id.to_string(),
+        resource,
+        change_types,
+        notification_url,
+        client_state,
+        user,
+        expiration_target_unix_ms: None,
+    }
+}
+
+impl DemoSubscriptionsStatusArgs {
+    fn run(self) -> anyhow::Result<()> {
+        let DemoSubscriptionsStatusArgs {
+            bundle,
+            provider,
+            binding_id,
+            tenant,
+            team,
+        } = self;
+        let team = if team.trim().is_empty() {
+            None
+        } else {
+            Some(team.clone())
+        };
+        let store = SubscriptionStore::new(state_root(&bundle));
+        let states = store.list_states()?;
+        let filtered = states
+            .into_iter()
+            .filter(|state| state.tenant == tenant)
+            .filter(|state| match team.as_deref() {
+                Some(team) => state.team.as_deref().unwrap_or("default") == team,
+                None => true,
+            })
+            .filter(|state| {
+                provider
+                    .as_deref()
+                    .map(|value| state.provider == value)
+                    .unwrap_or(true)
+            })
+            .filter(|state| {
+                binding_id
+                    .as_deref()
+                    .map(|value| state.binding_id == value)
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        if filtered.is_empty() {
+            println!("no subscriptions found");
+            return Ok(());
+        }
+        for state in filtered {
+            let team_label = state.team.as_deref().unwrap_or("default");
+            let expiry = state.expiration_unix_ms.and_then(|ms| {
+                Utc.timestamp_millis_opt(ms)
+                    .single()
+                    .map(|value| value.to_rfc3339())
+            });
+            println!(
+                "{} {} {} binding={} tenant={} team={} expires={}",
+                state.provider,
+                state.subscription_id.as_deref().unwrap_or("<unknown>"),
+                state.change_types.join(","),
+                state.binding_id,
+                state.tenant,
+                team_label,
+                expiry.unwrap_or_else(|| "<unknown>".to_string())
+            );
+        }
+        Ok(())
+    }
+}
+
+impl DemoSubscriptionsRenewArgs {
+    fn run(self) -> anyhow::Result<()> {
+        let DemoSubscriptionsRenewArgs {
+            bundle,
+            binding_id,
+            provider,
+            tenant,
+            team,
+            skew_minutes,
+        } = self;
+        let team_override = if team.trim().is_empty() {
+            None
+        } else {
+            Some(team)
+        };
+        let (runner_host, context) = build_runner(&bundle, &tenant, team_override.clone())?;
+        let store = SubscriptionStore::new(state_root(&bundle));
+        let scheduler = Scheduler::new(
+            SubscriptionService::new(runner_host, context),
+            store.clone(),
+        );
+
+        if let Some(binding) = binding_id {
+            let provider = provider
+                .ok_or_else(|| anyhow!("--provider is required when renewing a single binding"))?;
+            let state = store
+                .read_state(&provider, &tenant, team_override.as_deref(), &binding)?
+                .ok_or_else(|| {
+                    anyhow!("subscription {binding} not found for provider {provider}")
+                })?;
+            scheduler.renew_binding(&state)?;
+            println!("renewed {}", binding);
+            return Ok(());
+        }
+
+        let skew = Duration::from_secs(skew_minutes * 60);
+        scheduler.renew_due(skew)?;
+        println!("renewed eligible subscriptions");
+        Ok(())
+    }
+}
+
+impl DemoSubscriptionsDeleteArgs {
+    fn run(self) -> anyhow::Result<()> {
+        let DemoSubscriptionsDeleteArgs {
+            bundle,
+            binding_id,
+            provider,
+            tenant,
+            team,
+        } = self;
+        let team_override = if team.trim().is_empty() {
+            None
+        } else {
+            Some(team)
+        };
+        let (runner_host, context) = build_runner(&bundle, &tenant, team_override.clone())?;
+        let store = SubscriptionStore::new(state_root(&bundle));
+        let scheduler = Scheduler::new(
+            SubscriptionService::new(runner_host, context),
+            store.clone(),
+        );
+        let state = store
+            .read_state(&provider, &tenant, team_override.as_deref(), &binding_id)?
+            .ok_or_else(|| {
+                anyhow!("subscription {binding_id} not found for provider {provider}")
+            })?;
+        scheduler.delete_binding(&state)?;
+        println!("deleted {}", binding_id);
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
+#[command(
     about = "Create a new demo bundle scaffold.",
     long_about = "Initializes the directory layout and metadata files that the demo commands expect.",
     after_help = "Main options:\n  <BUNDLE-NAME>\n\nOptional options:\n  --out <DIR> (default: current working directory)"
@@ -1075,6 +1451,7 @@ impl DemoCommand {
             DemoSubcommand::Doctor(args) => args.run(ctx),
             DemoSubcommand::Allow(args) => args.run(Policy::Public),
             DemoSubcommand::Forbid(args) => args.run(Policy::Forbidden),
+            DemoSubcommand::Subscriptions(args) => args.run(),
         }
     }
 }
@@ -3147,7 +3524,7 @@ fn copy_resolved_manifest(bundle: &Path, tenant: &str, team: Option<&str>) -> an
     Ok(())
 }
 
-fn discovery_map(
+pub(crate) fn discovery_map(
     providers: &[discovery::DetectedProvider],
 ) -> std::collections::BTreeMap<PathBuf, discovery::DetectedProvider> {
     let mut map = std::collections::BTreeMap::new();
@@ -3170,7 +3547,7 @@ fn provider_filter_matches(pack: &domains::ProviderPack, filter: &str) -> bool {
         || file_stem.contains(filter)
 }
 
-fn resolve_demo_provider_pack(
+pub(crate) fn resolve_demo_provider_pack(
     root: &Path,
     tenant: &str,
     team: Option<&str>,
@@ -3978,7 +4355,7 @@ fn event_components(
     services.events.components.clone()
 }
 
-fn provider_id_for_pack(
+pub(crate) fn provider_id_for_pack(
     pack_path: &Path,
     fallback: &str,
     provider_map: Option<&std::collections::BTreeMap<PathBuf, discovery::DetectedProvider>>,

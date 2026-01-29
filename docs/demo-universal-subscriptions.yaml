@@ -1,0 +1,16 @@
+# Example greentic.demo.yaml snippet that seeds a universal subscription
+services:
+  subscriptions:
+    mode: universal_ops
+    universal:
+      renew_interval_seconds: 60
+      renew_skew_minutes: 10
+      desired:
+        - provider: email
+          resource: "/me/mailFolders('Inbox')/messages"
+          change_types: ["created", "updated"]
+          notification_url: "https://example.com/ingress/email/subscriptions/demo-bind"
+          client_state: "demo-universal"
+          user:
+            user_id: "alice@example.com"
+            token_key: "secrets://demo/default/messaging/alice_refresh_token"

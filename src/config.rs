@@ -163,10 +163,90 @@ pub struct DemoEgressConfig {
     pub args: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DemoSubscriptionsConfig {
+    #[serde(default = "default_subscriptions_mode")]
+    pub mode: DemoSubscriptionsMode,
+    #[serde(default)]
+    pub universal: DemoSubscriptionsUniversalConfig,
     #[serde(default)]
     pub msgraph: DemoMsgraphSubscriptionsConfig,
+}
+
+impl Default for DemoSubscriptionsConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_subscriptions_mode(),
+            universal: DemoSubscriptionsUniversalConfig::default(),
+            msgraph: DemoMsgraphSubscriptionsConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DemoSubscriptionsMode {
+    #[default]
+    LegacyGsm,
+    UniversalOps,
+}
+
+fn default_subscriptions_mode() -> DemoSubscriptionsMode {
+    DemoSubscriptionsMode::LegacyGsm
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DemoSubscriptionsUniversalConfig {
+    #[serde(default = "default_universal_renew_interval")]
+    pub renew_interval_seconds: u64,
+    #[serde(default = "default_universal_renew_skew")]
+    pub renew_skew_minutes: u64,
+    #[serde(default)]
+    pub desired: Vec<DemoDesiredSubscription>,
+}
+
+impl Default for DemoSubscriptionsUniversalConfig {
+    fn default() -> Self {
+        Self {
+            renew_interval_seconds: default_universal_renew_interval(),
+            renew_skew_minutes: default_universal_renew_skew(),
+            desired: Vec::new(),
+        }
+    }
+}
+
+fn default_universal_renew_interval() -> u64 {
+    60
+}
+
+fn default_universal_renew_skew() -> u64 {
+    10
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DemoDesiredSubscription {
+    pub provider: String,
+    pub resource: String,
+    #[serde(default = "default_change_types")]
+    pub change_types: Vec<String>,
+    #[serde(default)]
+    pub notification_url: Option<String>,
+    #[serde(default)]
+    pub client_state: Option<String>,
+    #[serde(default)]
+    pub binding_id: Option<String>,
+    #[serde(default)]
+    pub user: Option<AuthUserConfig>,
+}
+
+fn default_change_types() -> Vec<String> {
+    vec!["created".to_string()]
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AuthUserConfig {
+    pub user_id: String,
+    pub token_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

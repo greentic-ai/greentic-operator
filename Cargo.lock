@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-operator"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1822,6 +1822,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "messaging-cardkit",
+ "messaging-universal-dto",
  "rand 0.9.2",
  "rpassword",
  "serde",
@@ -3049,6 +3050,15 @@ dependencies = [
  "greentic-types",
  "gsm-core",
  "insta",
+ "serde_json",
+]
+
+[[package]]
+name = "messaging-universal-dto"
+version = "0.4.25"
+dependencies = [
+ "greentic-types",
+ "serde",
  "serde_json",
 ]
 
