@@ -8,6 +8,7 @@ use crate::supervisor::{self, ServiceId, ServiceSpec};
 const SERVICE_ID: &str = "cloudflared";
 const URL_SUFFIX: &str = ".trycloudflare.com";
 
+#[derive(Clone)]
 pub struct CloudflaredConfig {
     pub binary: PathBuf,
     pub local_port: u16,

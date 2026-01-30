@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::services::runner::{ProcessStatus, ServiceState, log_path, pid_path, start_process};
 
+#[derive(Clone)]
 pub struct ComponentSpec {
     pub id: String,
     pub binary: String,

@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    convert::TryFrom,
     env, fs,
     io::Write,
     net::SocketAddr,
@@ -21,7 +22,9 @@ use tokio::sync::Mutex;
 use crate::bin_resolver::{self, ResolveCtx};
 use crate::config;
 use crate::demo::http_ingress::{HttpIngressConfig, HttpIngressServer};
-use crate::demo::runner_host::{DemoRunnerHost, OperatorContext};
+use crate::demo::runner_host::{
+    DemoRunnerHost, FlowOutcome, OperatorContext, primary_provider_type,
+};
 use crate::demo::setup::{ProvidersInput, discover_tenants};
 use crate::demo::{self, BuildOptions};
 use crate::dev_mode::{
@@ -31,6 +34,7 @@ use crate::dev_mode::{
 use crate::discovery;
 use crate::domains::{self, Domain, DomainAction};
 use crate::gmap::{self, Policy};
+use crate::messaging_universal::{ProviderPayloadV1, egress};
 use crate::operator_log;
 use crate::project::{self, ScanFormat};
 use crate::runner_exec;
@@ -47,6 +51,7 @@ use crate::subscriptions_universal::{
     state_root,
     store::{AuthUserRefV1, SubscriptionStore},
 };
+use greentic_types::{ChannelMessageEnvelope, EnvId, TeamId, TenantCtx, TenantId};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -1941,13 +1946,15 @@ impl DemoUpArgs {
             let state_dir = bundle.join("state");
             let log_dir = self.log_dir.clone().unwrap_or_else(|| bundle.join("logs"));
             let log_dir = operator_log::init(log_dir.clone(), log_level)?;
+            let run_targets =
+                select_bundle_run_targets(&bundle, self.tenant.as_deref(), self.team.as_deref())?;
+            let target_summary = format_bundle_targets(&run_targets);
             operator_log::info(
                 module_path!(),
                 format!(
-                    "{command_label} (bundle={} tenant={:?} team={:?}) log_dir={}",
+                    "{command_label} (bundle={} targets=[{}]) log_dir={}",
                     bundle.display(),
-                    self.tenant,
-                    self.team,
+                    &target_summary,
                     log_dir.display()
                 ),
             );
@@ -1972,7 +1979,10 @@ impl DemoUpArgs {
                     self.cloudflared
                 );
             }
-            let tenant = self.tenant.clone().unwrap_or_else(|| "demo".to_string());
+            let tenant = self
+                .tenant
+                .clone()
+                .unwrap_or_else(|| DEMO_DEFAULT_TENANT.to_string());
             let config = config::load_operator_config(&bundle)?;
             let dev_settings =
                 resolve_dev_settings(&ctx.settings, config.as_ref(), &self.dev, &bundle)?;
@@ -1985,9 +1995,8 @@ impl DemoUpArgs {
             operator_log::info(
                 module_path!(),
                 format!(
-                    "bundle discovery tenant={} team={} messaging={} events={} providers={}",
-                    tenant,
-                    self.team.as_deref().unwrap_or("default"),
+                    "bundle discovery targets=[{}] messaging={} events={} providers={}",
+                    &target_summary,
                     discovery.domains.messaging,
                     discovery.domains.events,
                     discovery.providers.len()
@@ -2034,7 +2043,10 @@ impl DemoUpArgs {
             };
 
             let mut public_base_url = self.public_base_url.clone();
-            let team_id = self.team.clone().unwrap_or_else(|| "default".to_string());
+            let team_id = self
+                .team
+                .clone()
+                .unwrap_or_else(|| DEMO_DEFAULT_TEAM.to_string());
             let mut started_cloudflared_early = false;
             if public_base_url.is_none()
                 && self.setup_input.is_some()
@@ -2091,20 +2103,49 @@ impl DemoUpArgs {
                 )?;
             }
 
-            let result = demo::demo_up(
-                &bundle,
-                &tenant,
-                self.team.as_deref(),
-                explicit_nats_url.as_deref(),
-                nats_mode,
-                messaging_enabled,
-                cloudflared_config,
-                events_components,
-                &log_dir,
-                debug_enabled,
-            );
+            let start_result = {
+                let mut started = 0;
+                let guard = (|| -> anyhow::Result<()> {
+                    for target in &run_targets {
+                        demo::demo_up(
+                            &bundle,
+                            &target.tenant,
+                            target.team.as_deref(),
+                            explicit_nats_url.as_deref(),
+                            nats_mode,
+                            messaging_enabled,
+                            cloudflared_config.clone(),
+                            events_components.clone(),
+                            &log_dir,
+                            debug_enabled,
+                        )
+                        .with_context(|| {
+                            format!("target tenant={} team={}", target.tenant, target.team_id())
+                        })?;
+                        started += 1;
+                    }
+                    Ok(())
+                })();
+                if guard.is_err() {
+                    for target in &run_targets[..started] {
+                        if let Err(cleanup_err) = demo::demo_down_runtime(
+                            &state_dir,
+                            &target.tenant,
+                            target.team_id(),
+                            false,
+                        ) {
+                            eprintln!(
+                                "Warning: failed to stop earlier target tenant={} team={} : {cleanup_err}",
+                                target.tenant,
+                                target.team_id()
+                            );
+                        }
+                    }
+                }
+                guard
+            };
             let mut ingress_server = None;
-            if result.is_ok() {
+            if start_result.is_ok() {
                 match start_demo_ingress_server(
                     &bundle,
                     &discovery,
@@ -2130,31 +2171,40 @@ impl DemoUpArgs {
                     }
                 }
             }
-            if let Err(ref err) = result {
+            if let Err(ref err) = start_result {
                 operator_log::error(
                     module_path!(),
-                    format!("{command_label} bundle {} failed: {err}", bundle.display()),
+                    format!(
+                        "{command_label} bundle {} failed for targets=[{}]: {err}",
+                        bundle.display(),
+                        &target_summary
+                    ),
                 );
             } else {
                 operator_log::info(
                     module_path!(),
-                    format!("{command_label} bundle {} completed", bundle.display()),
+                    format!(
+                        "{command_label} bundle {} completed for targets=[{}]",
+                        bundle.display(),
+                        &target_summary
+                    ),
                 );
             }
-            if result.is_ok() {
+            if start_result.is_ok() {
                 println!(
-                    "{command_label} running (bundle={} tenant={} team={}); press Ctrl+C to stop",
+                    "{command_label} running (bundle={} targets=[{}]); press Ctrl+C to stop",
                     bundle.display(),
-                    tenant,
-                    team_id
+                    &target_summary
                 );
                 wait_for_ctrlc()?;
                 if let Some(server) = ingress_server.take() {
                     server.stop()?;
                 }
-                demo::demo_down_runtime(&state_dir, &tenant, &team_id, false)?;
+                for target in run_targets.iter().rev() {
+                    demo::demo_down_runtime(&state_dir, &target.tenant, target.team_id(), false)?;
+                }
             }
-            return result;
+            return start_result;
         }
 
         let config_path = resolve_demo_config_path(self.config.clone())?;
@@ -2252,6 +2302,114 @@ impl DemoUpArgs {
         }
         result
     }
+}
+
+const DEMO_DEFAULT_TENANT: &str = "demo";
+const DEMO_DEFAULT_TEAM: &str = "default";
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DemoBundleTarget {
+    tenant: String,
+    team: Option<String>,
+}
+
+impl DemoBundleTarget {
+    fn label(&self) -> String {
+        match &self.team {
+            Some(team) if !team.is_empty() => format!("{}.{}", self.tenant, team),
+            _ => self.tenant.clone(),
+        }
+    }
+
+    fn matches_filters(&self, tenant_filter: Option<&str>, team_filter: Option<&str>) -> bool {
+        if let Some(filter) = tenant_filter {
+            if filter != self.tenant {
+                return false;
+            }
+        }
+        if let Some(filter) = team_filter {
+            if filter != self.team_id() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn team_id(&self) -> &str {
+        self.team.as_deref().unwrap_or(DEMO_DEFAULT_TEAM)
+    }
+}
+
+fn format_bundle_targets(targets: &[DemoBundleTarget]) -> String {
+    targets
+        .iter()
+        .map(|target| target.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn select_bundle_run_targets(
+    bundle: &Path,
+    tenant_filter: Option<&str>,
+    team_filter: Option<&str>,
+) -> anyhow::Result<Vec<DemoBundleTarget>> {
+    let resolved_targets = discover_bundle_run_targets(bundle)?;
+    let filtered = resolved_targets
+        .iter()
+        .filter(|target| target.matches_filters(tenant_filter, team_filter))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !filtered.is_empty() {
+        return Ok(filtered);
+    }
+    if resolved_targets.is_empty() {
+        let tenant = tenant_filter.unwrap_or(DEMO_DEFAULT_TENANT).to_string();
+        let team = team_filter.map(|value| value.to_string());
+        return Ok(vec![DemoBundleTarget { tenant, team }]);
+    }
+    anyhow::bail!(
+        "no resolved targets matched tenant={:?} team={:?}",
+        tenant_filter,
+        team_filter
+    );
+}
+
+fn discover_bundle_run_targets(bundle: &Path) -> anyhow::Result<Vec<DemoBundleTarget>> {
+    let resolved_dir = bundle.join("state").join("resolved");
+    if !resolved_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut seen = BTreeSet::new();
+    for entry in fs::read_dir(resolved_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(ext) = path.extension().and_then(|value| value.to_str()) {
+            let ext = ext.to_ascii_lowercase();
+            if ext != "yaml" && ext != "yml" {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|value| value.to_str()) {
+            Some(value) if !value.is_empty() => value,
+            _ => continue,
+        };
+        let mut parts = stem.splitn(2, '.');
+        let tenant = match parts.next() {
+            Some(value) if !value.is_empty() => value.to_string(),
+            _ => continue,
+        };
+        let team = parts
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        seen.insert(DemoBundleTarget { tenant, team });
+    }
+    Ok(seen.into_iter().collect())
 }
 
 impl DemoSetupArgs {
@@ -2355,6 +2513,8 @@ impl DemoSendArgs {
             &self.provider,
             Domain::Messaging,
         )?;
+        let provider_type = primary_provider_type(&pack.path)
+            .context("failed to determine provider type for demo send")?;
         let discovery = discovery::discover_with_options(
             &self.bundle,
             discovery::DiscoveryOptions { cbor_only: true },
@@ -2423,37 +2583,145 @@ impl DemoSendArgs {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--text is required unless --print-required-args"))?;
         let args = merge_args(self.args_json.as_deref(), &self.args)?;
-        let mut payload = serde_json::json!({
-            "tenant": self.tenant,
-            "provider": provider_id,
-            "text": text,
-            "args": JsonValue::Object(args),
-        });
-        if let Some(team) = team {
-            payload["team"] = JsonValue::String(team.to_string());
-        }
+        let message = build_demo_send_message(&text, &args, &self.tenant, team);
 
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        let outcome = runner_host.invoke_provider_op(
-            Domain::Messaging,
+        // Compose a message plan and encode payload directly against the provider component (no flow resolution).
+        let plan_value = run_provider_component_op_json(
+            &runner_host,
+            &pack,
             &provider_id,
-            "send",
-            &payload_bytes,
             &context,
-        )?;
-        if outcome.success {
-            println!("ok");
-            if let Some(value) = outcome.output {
-                let json = serde_json::to_string_pretty(&value)?;
-                println!("{json}");
-            } else if let Some(raw) = outcome.raw {
-                println!("{raw}");
+            "render_plan",
+            serde_json::to_value(egress::build_render_plan_input(message.clone()))?,
+        )
+        .with_context(|| "render_plan failed")?;
+        let encode_input = egress::build_encode_input(message.clone(), plan_value.clone());
+        let payload_value = run_provider_component_op_json(
+            &runner_host,
+            &pack,
+            &provider_id,
+            &context,
+            "encode",
+            serde_json::to_value(encode_input)?,
+        )
+        .with_context(|| "encode failed")?;
+        let payload = match parse_provider_payload(payload_value) {
+            Ok(value) => value,
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("encode output invalid: {err}; using fallback payload"),
+                );
+                let mut fallback_body = serde_json::Map::new();
+                if let JsonValue::Object(ref envelope) = message {
+                    if let Some(JsonValue::String(text)) = envelope.get("text") {
+                        fallback_body.insert("text".to_string(), JsonValue::String(text.clone()));
+                    }
+                    if let Some(JsonValue::Object(metadata)) = envelope.get("metadata") {
+                        for (key, value) in metadata {
+                            fallback_body.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                if fallback_body.is_empty() {
+                    fallback_body.insert("text".to_string(), JsonValue::String(text.clone()));
+                }
+                let body_value = JsonValue::Object(fallback_body);
+                let body_bytes = serde_json::to_vec(&body_value)?;
+                ProviderPayloadV1 {
+                    content_type: "application/json".to_string(),
+                    body_b64: general_purpose::STANDARD.encode(&body_bytes),
+                    metadata_json: Some(serde_json::to_string(&body_value)?),
+                }
             }
-            return Ok(());
+        };
+        let send_input = egress::build_send_payload(
+            payload,
+            self.tenant.clone(),
+            team.map(|value| value.to_string()),
+        );
+        let mut send_value = serde_json::to_value(&send_input)?;
+        if let Some(map) = send_value.as_object_mut() {
+            map.insert(
+                "provider_type".to_string(),
+                JsonValue::String(provider_type.clone()),
+            );
         }
-        let message = outcome.error.unwrap_or_else(|| "send failed".to_string());
-        Err(anyhow::anyhow!(message))
+        let send_outcome = run_provider_component_op(
+            &runner_host,
+            &pack,
+            &provider_id,
+            &context,
+            "send_payload",
+            send_value,
+        )
+        .context("send_payload failed")?;
+        println!("ok");
+        if let Some(value) = send_outcome.output {
+            let json = serde_json::to_string_pretty(&value)?;
+            println!("{json}");
+        } else if let Some(raw) = send_outcome.raw {
+            println!("{raw}");
+        }
+        Ok(())
     }
+}
+
+fn run_provider_component_op(
+    runner_host: &DemoRunnerHost,
+    pack: &domains::ProviderPack,
+    provider_id: &str,
+    ctx: &OperatorContext,
+    op: &str,
+    payload: serde_json::Value,
+) -> anyhow::Result<FlowOutcome> {
+    let bytes = serde_json::to_vec(&payload)?;
+    let outcome = runner_host.invoke_provider_component_op_direct(
+        Domain::Messaging,
+        pack,
+        provider_id,
+        op,
+        &bytes,
+        ctx,
+    )?;
+    ensure_provider_op_success(provider_id, op, &outcome)?;
+    Ok(outcome)
+}
+
+fn run_provider_component_op_json(
+    runner_host: &DemoRunnerHost,
+    pack: &domains::ProviderPack,
+    provider_id: &str,
+    ctx: &OperatorContext,
+    op: &str,
+    payload: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let outcome = run_provider_component_op(runner_host, pack, provider_id, ctx, op, payload)?;
+    Ok(outcome.output.unwrap_or_else(|| json!({})))
+}
+
+fn parse_provider_payload(mut value: JsonValue) -> anyhow::Result<ProviderPayloadV1> {
+    if let JsonValue::Object(ref mut map) = value {
+        map.entry("content_type")
+            .or_insert_with(|| JsonValue::String("application/json".to_string()));
+    }
+    serde_json::from_value(value).context("provider payload is invalid")
+}
+
+fn ensure_provider_op_success(
+    provider_id: &str,
+    op: &str,
+    outcome: &FlowOutcome,
+) -> anyhow::Result<()> {
+    if outcome.success {
+        return Ok(());
+    }
+    let message = outcome
+        .error
+        .clone()
+        .or_else(|| outcome.raw.clone())
+        .unwrap_or_else(|| "unknown error".to_string());
+    Err(anyhow::anyhow!("{provider_id}.{op} failed: {message}"))
 }
 
 impl DemoReceiveArgs {
@@ -4500,6 +4768,49 @@ fn merge_args(
         merged.insert(key, value);
     }
     Ok(merged)
+}
+
+fn build_demo_send_message(
+    text: &str,
+    args: &JsonMap<String, JsonValue>,
+    tenant: &str,
+    team: Option<&str>,
+) -> JsonValue {
+    let mut metadata = BTreeMap::new();
+    for (key, value) in args {
+        metadata.insert(key.clone(), value.to_string());
+    }
+    let env_value = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+    let env = EnvId::try_from(env_value.clone())
+        .unwrap_or_else(|_| EnvId::try_from("local").expect("local env invalid"));
+    let tenant_id = TenantId::try_from(tenant.to_string())
+        .unwrap_or_else(|_| TenantId::try_from("demo").expect("demo tenant invalid"));
+    let mut tenant_ctx = TenantCtx::new(env, tenant_id.clone());
+    if let Some(team_value) = team {
+        if let Ok(team_id) = TeamId::try_from(team_value.to_string()) {
+            tenant_ctx = tenant_ctx.with_team(Some(team_id));
+        }
+    }
+    tenant_ctx = tenant_ctx
+        .with_session(Uuid::new_v4().to_string())
+        .with_flow(Uuid::new_v4().to_string())
+        .with_node("demo".to_string())
+        .with_provider("messaging-telegram")
+        .with_attempt(1);
+
+    let envelope = ChannelMessageEnvelope {
+        id: Uuid::new_v4().to_string(),
+        tenant: tenant_ctx,
+        channel: "messaging.telegram".to_string(),
+        session_id: Uuid::new_v4().to_string(),
+        reply_scope: None,
+        user_id: None,
+        correlation_id: None,
+        text: Some(text.to_string()),
+        attachments: Vec::new(),
+        metadata,
+    };
+    serde_json::to_value(envelope).unwrap_or(JsonValue::Null)
 }
 
 fn format_requirements_output(value: &JsonValue) -> Option<String> {

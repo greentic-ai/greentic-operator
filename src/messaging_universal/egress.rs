@@ -247,7 +247,7 @@ pub fn run_end_to_end(
     Ok(())
 }
 
-fn render_plan(
+pub fn render_plan(
     runner_host: &DemoRunnerHost,
     ctx: &OperatorContext,
     provider: &str,
@@ -265,7 +265,7 @@ fn render_plan(
     Ok(validated.output.clone().unwrap_or_else(|| json!({})))
 }
 
-fn encode_payload(
+pub fn encode_payload(
     runner_host: &DemoRunnerHost,
     ctx: &OperatorContext,
     provider: &str,

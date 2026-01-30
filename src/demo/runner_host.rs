@@ -1,12 +1,31 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use greentic_runner_desktop::RunStatus;
+use greentic_runner_host::{
+    RunnerWasiPolicy,
+    component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx},
+    config::{
+        FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
+        WebhookPolicy,
+    },
+    pack::{ComponentResolution, PackRuntime},
+    secrets::default_manager,
+    storage::{DynSessionStore, new_state_store},
+    trace::TraceConfig,
+    validate::ValidationConfig,
+};
+use greentic_types::decode_pack_manifest;
 use serde_json::{Value as JsonValue, json};
+use tokio::runtime::Runtime as TokioRuntime;
+use zip::ZipArchive;
 
 use crate::runner_exec;
 use crate::runner_integration;
@@ -153,86 +172,91 @@ impl DemoRunnerHost {
                 )
             })?;
 
-        let flow_id = op_id;
-        if self.debug_enabled {
-            operator_log::debug(
-                module_path!(),
-                format!(
-                    "[demo dev] invoking provider domain={} provider={} flow={} tenant={} team={} payload_len={} preview={}",
-                    domains::domain_name(domain),
-                    provider_type,
-                    flow_id,
-                    ctx.tenant,
-                    ctx.team.as_deref().unwrap_or("default"),
-                    payload_bytes.len(),
-                    payload_preview(payload_bytes),
-                ),
-            );
-        }
-        let run_dir = state_layout::run_dir(&self.bundle_root, domain, &pack.pack_id, flow_id)?;
-        std::fs::create_dir_all(&run_dir)?;
+        if pack.entry_flows.iter().any(|flow| flow == op_id) {
+            let flow_id = op_id;
+            if self.debug_enabled {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[demo dev] invoking provider domain={} provider={} flow={} tenant={} team={} payload_len={} preview={}",
+                        domains::domain_name(domain),
+                        provider_type,
+                        flow_id,
+                        ctx.tenant,
+                        ctx.team.as_deref().unwrap_or("default"),
+                        payload_bytes.len(),
+                        payload_preview(payload_bytes),
+                    ),
+                );
+            }
+            let run_dir = state_layout::run_dir(&self.bundle_root, domain, &pack.pack_id, flow_id)?;
+            std::fs::create_dir_all(&run_dir)?;
 
-        let render_outcome = self
-            .card_renderer
-            .render_if_needed(provider_type, payload_bytes)?;
-        if let Some(meta) = &render_outcome.metadata {
+            let render_outcome = self
+                .card_renderer
+                .render_if_needed(provider_type, payload_bytes)?;
+            if let Some(meta) = &render_outcome.metadata {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "render provider={} tier={} target={} downgraded={} warnings={} corr={}",
+                        provider_type,
+                        meta.tier.as_str(),
+                        meta.target_tier.as_str(),
+                        meta.downgraded,
+                        meta.warnings_count,
+                        ctx.correlation_id.as_deref().unwrap_or("none"),
+                    ),
+                );
+            }
+            let payload = serde_json::from_slice(&render_outcome.bytes).unwrap_or_else(|_| {
+                json!({
+                    "payload": general_purpose::STANDARD.encode(&render_outcome.bytes)
+                })
+            });
+
+            let outcome = match &self.runner_mode {
+                RunnerMode::Exec => {
+                    self.execute_with_runner_exec(domain, pack, flow_id, &payload, ctx, &run_dir)?
+                }
+                RunnerMode::Integration { binary, flavor } => self
+                    .execute_with_runner_integration(
+                        domain, pack, flow_id, &payload, ctx, &run_dir, binary, *flavor,
+                    )?,
+            };
+
+            if self.debug_enabled {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[demo dev] provider={} flow={} tenant={} team={} success={} mode={:?} error={:?} corr_id={}",
+                        provider_type,
+                        flow_id,
+                        ctx.tenant,
+                        ctx.team.as_deref().unwrap_or("default"),
+                        outcome.success,
+                        outcome.mode,
+                        outcome.error,
+                        ctx.correlation_id.as_deref().unwrap_or("none"),
+                    ),
+                );
+            }
             operator_log::info(
                 module_path!(),
                 format!(
-                    "render provider={} tier={} target={} downgraded={} warnings={} corr={}",
-                    provider_type,
-                    meta.tier.as_str(),
-                    meta.target_tier.as_str(),
-                    meta.downgraded,
-                    meta.warnings_count,
-                    ctx.correlation_id.as_deref().unwrap_or("none"),
-                ),
-            );
-        }
-        let payload = serde_json::from_slice(&render_outcome.bytes).unwrap_or_else(|_| {
-            json!({
-                "payload": general_purpose::STANDARD.encode(&render_outcome.bytes)
-            })
-        });
-
-        let outcome = match &self.runner_mode {
-            RunnerMode::Exec => {
-                self.execute_with_runner_exec(domain, pack, flow_id, &payload, ctx, &run_dir)?
-            }
-            RunnerMode::Integration { binary, flavor } => self.execute_with_runner_integration(
-                domain, pack, flow_id, &payload, ctx, &run_dir, binary, *flavor,
-            )?,
-        };
-
-        if self.debug_enabled {
-            operator_log::debug(
-                module_path!(),
-                format!(
-                    "[demo dev] provider={} flow={} tenant={} team={} success={} mode={:?} error={:?} corr_id={}",
+                    "invoke domain={} provider={} op={} mode={:?} corr={}",
+                    domains::domain_name(domain),
                     provider_type,
                     flow_id,
-                    ctx.tenant,
-                    ctx.team.as_deref().unwrap_or("default"),
-                    outcome.success,
                     outcome.mode,
-                    outcome.error,
-                    ctx.correlation_id.as_deref().unwrap_or("none"),
+                    ctx.correlation_id.as_deref().unwrap_or("none")
                 ),
             );
-        }
-        operator_log::info(
-            module_path!(),
-            format!(
-                "invoke domain={} provider={} op={} mode={:?} corr={}",
-                domains::domain_name(domain),
-                provider_type,
-                flow_id,
-                outcome.mode,
-                ctx.correlation_id.as_deref().unwrap_or("none")
-            ),
-        );
 
-        Ok(outcome)
+            return Ok(outcome);
+        }
+
+        self.invoke_provider_component_op(domain, pack, provider_type, op_id, payload_bytes, ctx)
     }
 
     fn execute_with_runner_exec(
@@ -312,6 +336,116 @@ impl DemoRunnerHost {
             mode: RunnerExecutionMode::Integration,
         })
     }
+
+    pub fn invoke_provider_component_op_direct(
+        &self,
+        domain: Domain,
+        pack: &ProviderPack,
+        provider_id: &str,
+        op_id: &str,
+        payload_bytes: &[u8],
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        self.invoke_provider_component_op(domain, pack, provider_id, op_id, payload_bytes, ctx)
+    }
+
+    fn invoke_provider_component_op(
+        &self,
+        _domain: Domain,
+        pack: &ProviderPack,
+        _provider_id: &str,
+        op_id: &str,
+        payload_bytes: &[u8],
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        let secrets_manager = default_manager()
+            .context("failed to create secrets manager for provider invocation")?;
+        let runtime = TokioRuntime::new()
+            .context("failed to create tokio runtime for provider invocation")?;
+        let payload = payload_bytes.to_vec();
+        let result = runtime.block_on(async {
+            let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
+            let pack_runtime = PackRuntime::load(
+                &pack.path,
+                host_config.clone(),
+                None,
+                Some(&pack.path),
+                None::<DynSessionStore>,
+                Some(new_state_store()),
+                Arc::new(RunnerWasiPolicy::default()),
+                secrets_manager.clone(),
+                None,
+                false,
+                ComponentResolution::default(),
+            )
+            .await?;
+            let provider_type = primary_provider_type(&pack.path)
+                .context("failed to determine provider type for direct invocation")?;
+            let binding = pack_runtime.resolve_provider(None, Some(&provider_type))?;
+            let exec_ctx = ComponentExecCtx {
+                tenant: ComponentTenantCtx {
+                    tenant: ctx.tenant.clone(),
+                    team: ctx.team.clone(),
+                    user: None,
+                    trace_id: None,
+                    correlation_id: ctx.correlation_id.clone(),
+                    deadline_unix_ms: None,
+                    attempt: 1,
+                    idempotency_key: None,
+                },
+                flow_id: op_id.to_string(),
+                node_id: Some(op_id.to_string()),
+            };
+            pack_runtime
+                .invoke_provider(&binding, exec_ctx, op_id, payload)
+                .await
+        });
+
+        match result {
+            Ok(value) => Ok(FlowOutcome {
+                success: true,
+                output: Some(value),
+                raw: None,
+                error: None,
+                mode: RunnerExecutionMode::Exec,
+            }),
+            Err(err) => Ok(FlowOutcome {
+                success: false,
+                output: None,
+                raw: None,
+                error: Some(err.to_string()),
+                mode: RunnerExecutionMode::Exec,
+            }),
+        }
+    }
+}
+
+pub fn primary_provider_type(pack_path: &Path) -> anyhow::Result<String> {
+    let file = std::fs::File::open(pack_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
+        anyhow!(
+            "failed to open manifest.cbor in {}: {err}",
+            pack_path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    manifest_entry.read_to_end(&mut bytes)?;
+    let manifest = decode_pack_manifest(&bytes)
+        .context("failed to decode pack manifest for provider introspection")?;
+    let inline = manifest.provider_extension_inline().ok_or_else(|| {
+        anyhow!(
+            "pack {} provider extension missing or not inline",
+            pack_path.display()
+        )
+    })?;
+    let provider = inline.providers.first().ok_or_else(|| {
+        anyhow!(
+            "pack {} provider extension contains no providers",
+            pack_path.display()
+        )
+    })?;
+    Ok(provider.provider_type.clone())
 }
 
 fn read_transcript_outputs(run_dir: &Path) -> anyhow::Result<Option<JsonValue>> {
@@ -333,6 +467,28 @@ fn read_transcript_outputs(run_dir: &Path) -> anyhow::Result<Option<JsonValue>> 
         }
     }
     Ok(last)
+}
+
+fn build_demo_host_config(tenant: &str) -> HostConfig {
+    HostConfig {
+        tenant: tenant.to_string(),
+        bindings_path: PathBuf::from("<demo-provider>"),
+        flow_type_bindings: HashMap::new(),
+        rate_limits: RateLimits::default(),
+        retry: FlowRetryConfig::default(),
+        http_enabled: true,
+        secrets_policy: SecretsPolicy::allow_all(),
+        state_store_policy: StateStorePolicy::default(),
+        webhook_policy: WebhookPolicy::default(),
+        timers: Vec::new(),
+        oauth: None,
+        mocks: None,
+        pack_bindings: Vec::new(),
+        env_passthrough: Vec::new(),
+        trace: TraceConfig::from_env(),
+        validation: ValidationConfig::from_env(),
+        operator_policy: OperatorPolicy::allow_all(),
+    }
 }
 
 fn validate_runner_binary(path: PathBuf) -> Option<PathBuf> {
