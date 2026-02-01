@@ -1,6 +1,6 @@
 [package]
 name = "greentic-operator"
-version = "0.4.10"
+version = "0.4.11"
 edition = "2024"
 rust-version = "1.90"
 description = "Greentic operator CLI for local dev and demo orchestration."
@@ -28,11 +28,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "signal", "net"]
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 hyper-util = "0.1"
-gsm-gateway = { version = "0.4" }
-gsm-egress = { version = "0.4" }
-gsm-subscriptions-teams = { version = "0.4" }
-gsm-core = { version = "0.4" }
-messaging-cardkit = { path = "crates/messaging-cardkit" }
+#gsm-gateway = { version = "0.4" }
+#gsm-egress = { version = "0.4" }
+#gsm-subscriptions-teams = { version = "0.4" }
+#gsm-core = { version = "0.4" }
 messaging-universal-dto = { path = "../greentic-messaging-providers/crates/messaging-universal-dto" }
 rpassword = "7"
 greentic-secrets-lib = "0.4.14"
@@ -47,9 +46,5 @@ tempfile = "3.10"
 
 [workspace]
 members = [
-    "crates/messaging-cardkit",
     "secret_name",
 ]
-
-[patch.crates-io]
-gsm-core = { path = "../greentic-messaging/libs/core" }

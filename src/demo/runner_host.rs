@@ -40,7 +40,6 @@ use crate::operator_log;
 use crate::secrets_gate::{self, DynSecretsManager};
 use crate::secrets_manager;
 use crate::state_layout;
-use messaging_cardkit::Tier;
 
 #[derive(Clone)]
 pub struct OperatorContext {
@@ -138,7 +137,7 @@ impl DemoRunnerHost {
             runner_mode: mode,
             catalog,
             _secrets_manager: secrets_manager,
-            card_renderer: CardRenderer::new(Tier::Premium),
+            card_renderer: CardRenderer::new(),
             debug_enabled,
         })
     }
@@ -196,20 +195,6 @@ impl DemoRunnerHost {
             let render_outcome = self
                 .card_renderer
                 .render_if_needed(provider_type, payload_bytes)?;
-            if let Some(meta) = &render_outcome.metadata {
-                operator_log::info(
-                    module_path!(),
-                    format!(
-                        "render provider={} tier={} target={} downgraded={} warnings={} corr={}",
-                        provider_type,
-                        meta.tier.as_str(),
-                        meta.target_tier.as_str(),
-                        meta.downgraded,
-                        meta.warnings_count,
-                        ctx.correlation_id.as_deref().unwrap_or("none"),
-                    ),
-                );
-            }
             let payload = serde_json::from_slice(&render_outcome.bytes).unwrap_or_else(|_| {
                 json!({
                     "payload": general_purpose::STANDARD.encode(&render_outcome.bytes)

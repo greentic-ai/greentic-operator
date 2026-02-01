@@ -110,9 +110,6 @@ fn infer_repo(name: &str) -> String {
     if name.starts_with("greentic-") {
         return name.to_string();
     }
-    if name.starts_with("gsm-") {
-        return name.to_string();
-    }
     name.to_string()
 }
 

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env,
     fs::File,
     io::Read,
@@ -108,10 +108,10 @@ struct DevStoreSecretsManager {
 
 impl DevStoreSecretsManager {
     fn open() -> AnyhowResult<Self> {
-        if let Some(path) = override_dev_store_path().or_else(find_default_dev_store_path) {
-            if path.exists() {
-                return open_with_path(path);
-            }
+        if let Some(path) = override_dev_store_path().or_else(find_default_dev_store_path)
+            && path.exists()
+        {
+            return open_with_path(path);
         }
         let store = DevStore::open_default()
             .map_err(|err| anyhow!("failed to open dev secrets store: {err}"))?;
@@ -366,6 +366,43 @@ fn secret_uri_candidates(
     candidates
 }
 
+fn display_secret_candidates(
+    env: &str,
+    tenant: &str,
+    canonical_team: &str,
+    key: &str,
+    provider_id: &str,
+    provider_type: Option<&str>,
+) -> Vec<String> {
+    let normalized_key = secret_name::canonical_secret_name(key);
+    let prefix = format!("secrets://{}/{}/{}/", env, tenant, canonical_team);
+    let mut candidates = Vec::new();
+    let mut push_namespace = |namespace: &str| {
+        let trimmed = namespace.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let candidate = format!("{prefix}{trimmed}/{normalized_key}");
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    };
+    push_namespace("messaging");
+    push_namespace(provider_id);
+    if let Some(provider_type) = provider_type {
+        push_namespace(provider_type);
+    }
+    const DISPLAY_SUFFIXES: &[&str] = &[
+        "messaging-telegram",
+        "messaging.telegram.bot",
+        "messaging/telegram/bot",
+    ];
+    for suffix in DISPLAY_SUFFIXES {
+        push_namespace(suffix);
+    }
+    candidates
+}
+
 fn canonical_namespace(value: &str) -> Option<String> {
     let normalized = secret_name::canonical_secret_key_path(value);
     if normalized.is_empty() {
@@ -376,6 +413,7 @@ fn canonical_namespace(value: &str) -> Option<String> {
 }
 
 /// Check that the required secrets for the provider exist.
+#[allow(clippy::too_many_arguments)]
 pub fn check_provider_secrets(
     manager: &DynSecretsManager,
     env: &str,
@@ -413,6 +451,14 @@ pub fn check_provider_secrets(
         let mut missing = Vec::new();
         for key in keys {
             let candidates = secret_uri_candidates(
+                env,
+                tenant,
+                &canonical_team_owned,
+                &key,
+                provider_id,
+                provider_type,
+            );
+            let display_candidates = display_secret_candidates(
                 env,
                 tenant,
                 &canonical_team_owned,
@@ -460,7 +506,13 @@ pub fn check_provider_secrets(
                 ),
             );
             if !resolved {
-                missing.extend(candidate_missing);
+                let display_set: HashSet<_> =
+                    display_candidates.iter().collect();
+                missing.extend(
+                    candidate_missing
+                        .into_iter()
+                        .filter(|uri| display_set.contains(uri)),
+                );
             }
         }
         if missing.is_empty() {

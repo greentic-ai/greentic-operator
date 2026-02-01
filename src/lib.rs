@@ -3,6 +3,7 @@ pub mod cards;
 pub mod cli;
 pub mod cloudflared;
 pub mod config;
+pub mod config_gate;
 pub mod demo;
 pub mod dev_detect;
 pub mod dev_mode;

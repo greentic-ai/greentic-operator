@@ -15,12 +15,12 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use base64::{Engine as _, engine::general_purpose};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use gsm_core::{PROVIDER_ID_KEY, ingress_subject_with_prefix};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
 use crate::bin_resolver::{self, ResolveCtx};
 use crate::config;
+use crate::config_gate::{self, ConfigGateItem, ConfigValueSource};
 use crate::demo::http_ingress::{HttpIngressConfig, HttpIngressServer};
 use crate::demo::runner_host::{
     DemoRunnerHost, FlowOutcome, OperatorContext, primary_provider_type,
@@ -52,7 +52,7 @@ use crate::subscriptions_universal::{
     state_root,
     store::{AuthUserRefV1, SubscriptionStore},
 };
-use greentic_types::{ChannelMessageEnvelope, EnvId, TeamId, TenantCtx, TenantId};
+use greentic_types::{ChannelMessageEnvelope, Destination, EnvId, TeamId, TenantCtx, TenantId};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -108,8 +108,6 @@ enum DevSubcommand {
     Forbid(DevPolicyArgs),
     #[command(hide = true)]
     Up(DevUpArgs),
-    #[command(hide = true)]
-    Embedded(DevEmbeddedArgs),
     #[command(hide = true)]
     Down(DevDownArgs),
     #[command(name = "svc-status", hide = true)]
@@ -899,6 +897,13 @@ struct DemoSendArgs {
     runner_binary: Option<PathBuf>,
     #[arg(long, default_value = "demo")]
     env: String,
+    #[arg(long, help = "Destination identifier (repeatable).")]
+    to: Vec<String>,
+    #[arg(
+        long = "to-kind",
+        help = "Optional destination kind (chat, channel, room, email, etc.)."
+    )]
+    to_kind: Option<String>,
 }
 
 #[derive(Parser)]
@@ -1375,13 +1380,6 @@ struct AppCtx {
 }
 
 impl DevCommand {
-    fn warn_legacy_gsm(command: &str) {
-        eprintln!(
-            "Warning: '{}' is a legacy GSM path; use the demo commands instead. This command will be removed in a future release.",
-            command
-        );
-    }
-
     fn run(self, ctx: &mut AppCtx) -> anyhow::Result<()> {
         match self.command {
             DevSubcommand::On(args) => {
@@ -1411,26 +1409,10 @@ impl DevCommand {
             DevSubcommand::Team(args) => args.run(),
             DevSubcommand::Allow(args) => args.run(Policy::Public),
             DevSubcommand::Forbid(args) => args.run(Policy::Forbidden),
-            DevSubcommand::Up(args) => {
-                Self::warn_legacy_gsm("greentic-operator dev up");
-                args.run(ctx)
-            }
-            DevSubcommand::Embedded(args) => {
-                Self::warn_legacy_gsm("greentic-operator dev embedded");
-                args.run(ctx)
-            }
-            DevSubcommand::Down(args) => {
-                Self::warn_legacy_gsm("greentic-operator dev down");
-                args.run()
-            }
-            DevSubcommand::SvcStatus(args) => {
-                Self::warn_legacy_gsm("greentic-operator dev svc-status");
-                args.run()
-            }
-            DevSubcommand::Logs(args) => {
-                Self::warn_legacy_gsm("greentic-operator dev logs");
-                args.run()
-            }
+            DevSubcommand::Up(args) => args.run(ctx),
+            DevSubcommand::Down(args) => args.run(),
+            DevSubcommand::SvcStatus(args) => args.run(),
+            DevSubcommand::Logs(args) => args.run(),
             DevSubcommand::Setup(args) => args.run(),
             DevSubcommand::Diagnostics(args) => args.run(),
             DevSubcommand::Verify(args) => args.run(),
@@ -1442,6 +1424,12 @@ impl DevCommand {
 
 impl DemoCommand {
     fn run(self, ctx: &AppCtx) -> anyhow::Result<()> {
+        if env::var("GREENTIC_ENV").is_err() {
+            // set_var is unsafe in this codebase, so wrap it accordingly.
+            unsafe {
+                std::env::set_var("GREENTIC_ENV", "demo");
+            }
+        }
         if self.debug {
             unsafe {
                 std::env::set_var("GREENTIC_OPERATOR_DEMO_DEBUG", "1");
@@ -1622,7 +1610,9 @@ impl DevUpArgs {
         }
 
         if messaging_enabled {
-            crate::services::run_services(&root)?;
+            println!(
+                "messaging: enabled but handled by the embedded runner; use `demo start` to run messaging services."
+            );
         } else {
             println!("messaging: skipped (disabled or no providers)");
         }
@@ -1642,29 +1632,6 @@ impl DevUpArgs {
     }
 }
 
-impl DevEmbeddedArgs {
-    fn run(self, _ctx: &AppCtx) -> anyhow::Result<()> {
-        let root = project_root(self.project_root)?;
-        let mut nats_started = false;
-        if !self.no_nats {
-            if let Err(err) = crate::services::start_nats(&root) {
-                eprintln!("Warning: failed to start NATS: {err}");
-            } else {
-                nats_started = true;
-            }
-        }
-
-        crate::services::run_services(&root)?;
-
-        if nats_started {
-            let nats = crate::services::stop_nats(&root)?;
-            println!("nats: {:?}", nats);
-        }
-
-        Ok(())
-    }
-}
-
 impl DevDownArgs {
     fn run(self) -> anyhow::Result<()> {
         let root = project_root(self.project_root)?;
@@ -1674,7 +1641,7 @@ impl DevDownArgs {
             .and_then(|config| config.services.clone())
             .unwrap_or_default();
         println!(
-            "messaging: embedded (starts/stops with `dev up`/`dev embedded`; Ctrl+C in those commands to exit)"
+            "messaging: runtime managed by `demo start`/`demo down`; `dev` commands now only handle events + NATS."
         );
 
         for id in event_component_ids(&services) {
@@ -1717,9 +1684,7 @@ impl DevStatusArgs {
         let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
 
         if messaging_enabled {
-            println!(
-                "messaging: embedded (starts/stops with `dev up`/`dev embedded`; Ctrl+C to exit)"
-            );
+            println!("messaging: enabled (runtime managed by `demo start`/`demo down`).");
         } else {
             println!("messaging: skipped (disabled or no providers)");
         }
@@ -1747,7 +1712,7 @@ impl DevLogsArgs {
         match self.service.unwrap_or(LogService::Messaging) {
             LogService::Messaging => {
                 println!(
-                    "messaging: logs are streamed to this process while `dev up`/`dev embedded` run; rerun those commands to see output."
+                    "messaging: logs appear while `demo start` runs; use `demo logs` to tail or print service logs."
                 );
                 Ok(())
             }
@@ -2332,15 +2297,15 @@ impl DemoBundleTarget {
     }
 
     fn matches_filters(&self, tenant_filter: Option<&str>, team_filter: Option<&str>) -> bool {
-        if let Some(filter) = tenant_filter {
-            if filter != self.tenant {
-                return false;
-            }
+        if let Some(filter) = tenant_filter
+            && filter != self.tenant
+        {
+            return false;
         }
-        if let Some(filter) = team_filter {
-            if filter != self.team_id() {
-                return false;
-            }
+        if let Some(filter) = team_filter
+            && filter != self.team_id()
+        {
+            return false;
         }
         true
     }
@@ -2595,7 +2560,67 @@ impl DemoSendArgs {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--text is required unless --print-required-args"))?;
         let args = merge_args(self.args_json.as_deref(), &self.args)?;
-        let message = build_demo_send_message(&text, &args, &self.tenant, team);
+        let mut config_items = Vec::new();
+        config_items.push(ConfigGateItem::new(
+            "env",
+            Some(env.clone()),
+            ConfigValueSource::Platform("GREENTIC_ENV"),
+            true,
+        ));
+        config_items.push(ConfigGateItem::new(
+            "tenant",
+            Some(self.tenant.clone()),
+            ConfigValueSource::Platform("tenant"),
+            true,
+        ));
+        let team_label = team.unwrap_or("default");
+        config_items.push(ConfigGateItem::new(
+            "team",
+            Some(team_label.to_string()),
+            ConfigValueSource::Platform("team"),
+            true,
+        ));
+        config_items.push(ConfigGateItem::new(
+            "text",
+            Some(text.clone()),
+            ConfigValueSource::Argument("--text"),
+            true,
+        ));
+        let mut arg_entries = args.iter().collect::<Vec<_>>();
+        arg_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (key, value) in arg_entries {
+            config_items.push(ConfigGateItem::new(
+                key.as_str(),
+                Some(config_value_display(value)),
+                ConfigValueSource::Argument("--arg"),
+                true,
+            ));
+        }
+        if !self.to.is_empty() {
+            config_items.push(ConfigGateItem::new(
+                "to",
+                Some(self.to.join(",")),
+                ConfigValueSource::Argument("--to"),
+                true,
+            ));
+        }
+        if let Some(kind) = self.to_kind.as_ref() {
+            config_items.push(ConfigGateItem::new(
+                "to-kind",
+                Some(kind.clone()),
+                ConfigValueSource::Argument("--to-kind"),
+                false,
+            ));
+        }
+        config_gate::log_config_gate(Domain::Messaging, &self.tenant, team, &env, &config_items);
+        let message = build_demo_send_message(
+            &text,
+            &args,
+            &self.tenant,
+            team,
+            &self.to,
+            self.to_kind.as_deref(),
+        );
 
         // Compose a message plan and encode payload directly against the provider component (no flow resolution).
         let plan_value = run_provider_component_op_json(
@@ -2738,6 +2763,7 @@ fn run_provider_component_op_json(
     Ok(outcome.output.unwrap_or_else(|| json!({})))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enrich_secret_error_payload(
     mut payload: serde_json::Value,
     ctx: &OperatorContext,
@@ -2767,14 +2793,13 @@ fn enrich_secret_error_payload(
     );
     if let serde_json::Value::Object(map) = &mut payload {
         for key in ["message", "error"] {
-            if let Some(entry) = map.get_mut(key) {
-                if let Some(text) = entry.as_str() {
-                    if text_contains_secret_error(text) {
-                        let suffix = secret_error_suffix(&context_suffix, missing_keys);
-                        let enriched = format!("{text} ({suffix})");
-                        *entry = serde_json::Value::String(enriched);
-                    }
-                }
+            if let Some(entry) = map.get_mut(key)
+                && let Some(text) = entry.as_str()
+                && text_contains_secret_error(text)
+            {
+                let suffix = secret_error_suffix(&context_suffix, missing_keys);
+                let enriched = format!("{text} ({suffix})");
+                *entry = serde_json::Value::String(enriched);
             }
         }
     }
@@ -2783,10 +2808,10 @@ fn enrich_secret_error_payload(
 
 fn payload_contains_secret_error(value: &JsonValue) -> bool {
     for key in ["message", "error"] {
-        if let Some(text) = value.get(key).and_then(JsonValue::as_str) {
-            if text_contains_secret_error(text) {
-                return true;
-            }
+        if let Some(text) = value.get(key).and_then(JsonValue::as_str)
+            && text_contains_secret_error(text)
+        {
+            return true;
         }
     }
     false
@@ -2806,6 +2831,7 @@ fn secret_error_suffix(context_suffix: &str, missing_keys: &[String]) -> String 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gather_missing_secret_keys(
     manager: &DynSecretsManager,
     env: &str,
@@ -3328,6 +3354,32 @@ fn select_demo_providers(
     }
 }
 
+fn normalized_subject_component(value: &str) -> String {
+    let mut normalized = value
+        .trim()
+        .replace([' ', '\t', '\n', '\r', '*', '>', '/'], "-");
+    if normalized.is_empty() {
+        normalized = "unknown".to_string();
+    }
+    normalized
+}
+
+fn ingress_subject_with_prefix(
+    prefix: &str,
+    env: &str,
+    tenant: &str,
+    team: &str,
+    platform: &str,
+) -> String {
+    format!(
+        "{prefix}.{}.{}.{}.{}",
+        normalized_subject_component(env),
+        normalized_subject_component(tenant),
+        normalized_subject_component(team),
+        normalized_subject_component(platform),
+    )
+}
+
 fn ingress_subject_filter(env: &str, tenant: &str, team: &str, domain: Domain) -> String {
     let prefix = format!("greentic.{}.ingress", domains::domain_name(domain));
     let base = ingress_subject_with_prefix(&prefix, env, tenant, team, "__provider__");
@@ -3478,6 +3530,8 @@ fn should_log_message(
         None => !filter_active,
     }
 }
+
+const PROVIDER_ID_KEY: &str = "provider_id";
 
 fn provider_id_from_message(payload: &[u8]) -> Option<String> {
     let parsed: JsonValue = serde_json::from_slice(payload).ok()?;
@@ -4936,6 +4990,8 @@ fn build_demo_send_message(
     args: &JsonMap<String, JsonValue>,
     tenant: &str,
     team: Option<&str>,
+    destinations: &[String],
+    to_kind: Option<&str>,
 ) -> JsonValue {
     let mut metadata = BTreeMap::new();
     for (key, value) in args {
@@ -4947,10 +5003,10 @@ fn build_demo_send_message(
     let tenant_id = TenantId::try_from(tenant.to_string())
         .unwrap_or_else(|_| TenantId::try_from("demo").expect("demo tenant invalid"));
     let mut tenant_ctx = TenantCtx::new(env, tenant_id.clone());
-    if let Some(team_value) = team {
-        if let Ok(team_id) = TeamId::try_from(team_value.to_string()) {
-            tenant_ctx = tenant_ctx.with_team(Some(team_id));
-        }
+    if let Some(team_value) = team
+        && let Ok(team_id) = TeamId::try_from(team_value.to_string())
+    {
+        tenant_ctx = tenant_ctx.with_team(Some(team_id));
     }
     tenant_ctx = tenant_ctx
         .with_session(Uuid::new_v4().to_string())
@@ -4959,19 +5015,38 @@ fn build_demo_send_message(
         .with_provider("messaging-telegram")
         .with_attempt(1);
 
+    let to_kind_owned = to_kind.map(|value| value.to_string());
+    let to = destinations
+        .iter()
+        .map(|value| Destination {
+            id: value.clone(),
+            kind: to_kind_owned.clone(),
+        })
+        .collect::<Vec<_>>();
     let envelope = ChannelMessageEnvelope {
         id: Uuid::new_v4().to_string(),
         tenant: tenant_ctx,
         channel: "messaging.telegram".to_string(),
         session_id: Uuid::new_v4().to_string(),
         reply_scope: None,
-        user_id: None,
+        from: None,
+        to,
         correlation_id: None,
         text: Some(text.to_string()),
         attachments: Vec::new(),
         metadata,
     };
     serde_json::to_value(envelope).unwrap_or(JsonValue::Null)
+}
+
+fn config_value_display(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(text) => text.clone(),
+        JsonValue::Number(number) => number.to_string(),
+        JsonValue::Bool(flag) => flag.to_string(),
+        JsonValue::Null => "<null>".to_string(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
 }
 
 fn format_requirements_output(value: &JsonValue) -> Option<String> {

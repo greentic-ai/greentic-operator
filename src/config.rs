@@ -390,7 +390,7 @@ fn default_nats_args() -> Vec<String> {
 }
 
 fn default_gateway_binary() -> String {
-    "gsm-gateway".to_string()
+    "gateway".to_string()
 }
 
 fn default_gateway_listen_addr() -> String {
@@ -402,11 +402,11 @@ fn default_gateway_port() -> u16 {
 }
 
 fn default_egress_binary() -> String {
-    "gsm-egress".to_string()
+    "egress".to_string()
 }
 
 fn default_msgraph_binary() -> String {
-    "gsm-msgraph-subscriptions".to_string()
+    "subscriptions-msgraph".to_string()
 }
 
 fn default_msgraph_mode() -> String {
