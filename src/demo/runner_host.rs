@@ -37,7 +37,7 @@ use crate::cards::CardRenderer;
 use crate::discovery;
 use crate::domains::{self, Domain, ProviderPack};
 use crate::operator_log;
-use crate::secrets_gate::{self, DynSecretsManager};
+use crate::secrets_gate::{DynSecretsManager, SecretsManagerHandle};
 use crate::secrets_manager;
 use crate::state_layout;
 
@@ -77,7 +77,7 @@ pub struct DemoRunnerHost {
     bundle_root: PathBuf,
     runner_mode: RunnerMode,
     catalog: HashMap<(Domain, String), ProviderPack>,
-    _secrets_manager: DynSecretsManager,
+    secrets_handle: SecretsManagerHandle,
     card_renderer: CardRenderer,
     debug_enabled: bool,
 }
@@ -88,14 +88,18 @@ impl DemoRunnerHost {
     }
 
     pub fn secrets_manager(&self) -> DynSecretsManager {
-        self._secrets_manager.clone()
+        self.secrets_handle.manager()
+    }
+
+    pub fn secrets_handle(&self) -> &SecretsManagerHandle {
+        &self.secrets_handle
     }
 
     pub fn new(
         bundle_root: PathBuf,
         discovery: &discovery::DiscoveryResult,
         runner_binary: Option<PathBuf>,
-        secrets_manager: DynSecretsManager,
+        secrets_handle: SecretsManagerHandle,
         debug_enabled: bool,
     ) -> anyhow::Result<Self> {
         let runner_binary = runner_binary.and_then(validate_runner_binary);
@@ -136,7 +140,7 @@ impl DemoRunnerHost {
             bundle_root,
             runner_mode: mode,
             catalog,
-            _secrets_manager: secrets_manager,
+            secrets_handle,
             card_renderer: CardRenderer::new(),
             debug_enabled,
         })
@@ -344,17 +348,31 @@ impl DemoRunnerHost {
         payload_bytes: &[u8],
         ctx: &OperatorContext,
     ) -> anyhow::Result<FlowOutcome> {
-        let secrets_handle = secrets_gate::resolve_secrets_manager(
-            &self.bundle_root,
-            &ctx.tenant,
-            ctx.team.as_deref(),
-        )
-        .context("failed to create secrets manager for provider invocation")?;
         let runtime = TokioRuntime::new()
             .context("failed to create tokio runtime for provider invocation")?;
         let payload = payload_bytes.to_vec();
         let result = runtime.block_on(async {
             let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
+            let dev_store_display = self
+                .secrets_handle
+                .dev_store_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<default>".to_string());
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "secrets backend for wasm: using_env_fallback={} dev_store={}",
+                    self.secrets_handle.using_env_fallback, dev_store_display,
+                ),
+            );
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "exec secrets: dev_store={} env_fallback={}",
+                    dev_store_display, self.secrets_handle.using_env_fallback,
+                ),
+            );
             let pack_runtime = PackRuntime::load(
                 &pack.path,
                 host_config.clone(),
@@ -363,7 +381,7 @@ impl DemoRunnerHost {
                 None::<DynSessionStore>,
                 Some(new_state_store()),
                 Arc::new(RunnerWasiPolicy::default()),
-                secrets_handle.manager(),
+                self.secrets_handle.runtime_manager(Some(&pack.pack_id)),
                 None,
                 false,
                 ComponentResolution::default(),

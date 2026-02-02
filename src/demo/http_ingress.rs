@@ -249,7 +249,7 @@ async fn handle_request_inner(
         &request,
         &context,
         None,
-        state.runner_host.secrets_manager(),
+        state.runner_host.secrets_handle().clone(),
     )
     .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
     if !events.is_empty() {

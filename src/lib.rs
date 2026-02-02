@@ -19,6 +19,7 @@ pub mod runner_exec;
 pub mod runner_integration;
 pub mod runtime_state;
 pub mod secret_name;
+pub mod secrets_client;
 pub mod secrets_gate;
 pub mod secrets_manager;
 pub mod services;

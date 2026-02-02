@@ -10,7 +10,7 @@ use crate::demo::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::discovery;
 use crate::domains::Domain;
 use crate::messaging_universal::dto::{HttpInV1, HttpOutV1};
-use crate::secrets_gate::DynSecretsManager;
+use crate::secrets_gate::SecretsManagerHandle;
 
 /// Construct an `HttpInV1` payload for the given request data.
 #[allow(clippy::too_many_arguments)]
@@ -52,7 +52,7 @@ pub fn run_ingress(
     request: &HttpInV1,
     ctx: &OperatorContext,
     runner_binary: Option<PathBuf>,
-    secrets_manager: DynSecretsManager,
+    secrets_handle: SecretsManagerHandle,
 ) -> anyhow::Result<(HttpOutV1, Vec<ChannelMessageEnvelope>)> {
     let discovery =
         discovery::discover_with_options(bundle, discovery::DiscoveryOptions { cbor_only: true })?;
@@ -60,7 +60,7 @@ pub fn run_ingress(
         bundle.to_path_buf(),
         &discovery,
         runner_binary,
-        secrets_manager,
+        secrets_handle.clone(),
         false,
     )?;
     let input_bytes = serde_json::to_vec(request)?;

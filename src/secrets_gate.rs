@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use std::{
     collections::{BTreeMap, HashSet},
     env,
@@ -9,29 +8,89 @@ use std::{
 };
 
 use anyhow::{Context, Result as AnyhowResult, anyhow};
+use async_trait::async_trait;
 use greentic_secrets_lib::env::EnvSecretsManager;
-use greentic_secrets_lib::{
-    Result as SecretResult, SecretError, SecretsManager, SecretsStore,
-    core::{Error as CoreError, seed::DevStore},
-};
+use greentic_secrets_lib::{Result as SecretResult, SecretError, SecretsManager};
 use serde::Deserialize;
 use serde_cbor::value::Value as CborValue;
 use tokio::runtime::Builder;
+use tracing::info;
 use zip::{ZipArchive, result::ZipError};
 
 use crate::operator_log;
 use crate::secret_name;
+use crate::secrets_client::SecretsClient;
 use crate::secrets_manager;
 
 type CborMap = BTreeMap<CborValue, CborValue>;
 
 pub type DynSecretsManager = Arc<dyn SecretsManager>;
 
-/// Returns a basic secrets manager implementation suitable for the operator.
-pub fn default_manager() -> DynSecretsManager {
-    Arc::new(EnvSecretsManager)
+struct LoggingSecretsManager {
+    inner: DynSecretsManager,
+    pack_id: Option<String>,
+    dev_store_path_display: String,
+    using_env_fallback: bool,
 }
 
+impl LoggingSecretsManager {
+    fn new(
+        inner: DynSecretsManager,
+        pack_id: Option<String>,
+        dev_store_path: Option<&Path>,
+        using_env_fallback: bool,
+    ) -> Self {
+        let dev_store_path_display = dev_store_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<default>".to_string());
+        Self {
+            inner,
+            pack_id,
+            dev_store_path_display,
+            using_env_fallback,
+        }
+    }
+
+    fn alias_for(&self, uri: &str) -> Option<String> {
+        let pack_id = self.pack_id.as_deref()?;
+        rewrite_provider_segment(uri, pack_id)
+    }
+}
+
+#[async_trait]
+impl SecretsManager for LoggingSecretsManager {
+    async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "WASM secrets read requested uri={path}; backend dev_store_path={} using_env_fallback={}",
+                self.dev_store_path_display, self.using_env_fallback,
+            ),
+        );
+        match self.inner.read(path).await {
+            Ok(value) => Ok(value),
+            Err(SecretError::NotFound(_)) => {
+                if let Some(alias) = self.alias_for(path) {
+                    operator_log::info(
+                        module_path!(),
+                        format!("WASM secrets alias attempt uri={alias}"),
+                    );
+                    return self.inner.read(&alias).await;
+                }
+                Err(SecretError::NotFound(path.to_string()))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn write(&self, path: &str, value: &[u8]) -> SecretResult<()> {
+        self.inner.write(path, value).await
+    }
+
+    async fn delete(&self, path: &str) -> SecretResult<()> {
+        self.inner.delete(path).await
+    }
+}
 const ENV_ALLOW_ENV_SECRETS: &str = "GREENTIC_ALLOW_ENV_SECRETS";
 
 #[derive(Clone)]
@@ -47,6 +106,15 @@ impl SecretsManagerHandle {
     pub fn manager(&self) -> DynSecretsManager {
         self.manager.clone()
     }
+
+    pub fn runtime_manager(&self, pack_id: Option<&str>) -> DynSecretsManager {
+        Arc::new(LoggingSecretsManager::new(
+            self.manager(),
+            pack_id.map(|id| id.to_string()),
+            self.dev_store_path.as_deref(),
+            self.using_env_fallback,
+        ))
+    }
 }
 
 pub fn resolve_secrets_manager(
@@ -58,10 +126,10 @@ pub fn resolve_secrets_manager(
     let team_owned = canonical_team.into_owned();
     let selection = secrets_manager::select_secrets_manager(bundle_root, tenant, &team_owned)?;
     let allow_env = matches!(env::var(ENV_ALLOW_ENV_SECRETS).as_deref(), Ok("1"));
-    let (manager, store_path, using_env_fallback) = match DevStoreSecretsManager::open() {
-        Ok(store) => {
-            let path = store.store_path();
-            (Arc::new(store) as DynSecretsManager, path, false)
+    let (manager, store_path, using_env_fallback) = match SecretsClient::open(bundle_root) {
+        Ok(client) => {
+            let path = client.store_path().map(|path| path.to_path_buf());
+            (Arc::new(client) as DynSecretsManager, path, false)
         }
         Err(err) => {
             if allow_env {
@@ -100,218 +168,6 @@ pub fn resolve_secrets_manager(
     })
 }
 
-#[derive(Clone)]
-struct DevStoreSecretsManager {
-    store: Arc<DevStore>,
-    store_path: Option<PathBuf>,
-}
-
-impl DevStoreSecretsManager {
-    fn open() -> AnyhowResult<Self> {
-        if let Some(path) = override_dev_store_path().or_else(find_default_dev_store_path)
-            && path.exists()
-        {
-            return open_with_path(path);
-        }
-        let store = DevStore::open_default()
-            .map_err(|err| anyhow!("failed to open dev secrets store: {err}"))?;
-        Ok(Self {
-            store: Arc::new(store),
-            store_path: None,
-        })
-    }
-
-    fn store_path(&self) -> Option<PathBuf> {
-        self.store_path.clone()
-    }
-}
-
-fn override_dev_store_path() -> Option<PathBuf> {
-    env::var("GREENTIC_DEV_SECRETS_PATH")
-        .ok()
-        .map(PathBuf::from)
-}
-
-fn find_default_dev_store_path() -> Option<PathBuf> {
-    let cwd = env::current_dir().ok()?;
-    let candidates = [
-        cwd.join(".greentic/dev/.dev.secrets.env"),
-        cwd.join(".greentic/state/dev/.dev.secrets.env"),
-    ];
-    candidates.into_iter().find(|path| path.exists())
-}
-
-fn open_with_path(path: PathBuf) -> AnyhowResult<DevStoreSecretsManager> {
-    let store = DevStore::with_path(path.clone())
-        .map_err(|err| anyhow!("failed to open dev secrets store: {err}"))?;
-    Ok(DevStoreSecretsManager {
-        store: Arc::new(store),
-        store_path: Some(path),
-    })
-}
-
-#[async_trait]
-impl SecretsManager for DevStoreSecretsManager {
-    async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
-        let context = SecretResolutionContext::from_path(path);
-        let store_desc = self
-            .store_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<default>".to_string());
-        let mut matched_candidate: Option<String> = None;
-        eprintln!(
-            "secrets_gate::DevStore read env={:?} tenant={:?} team={:?} canonical_team={:?} candidates={:?} store={} path={}",
-            context.env,
-            context.tenant,
-            context.team,
-            context.canonical_team,
-            context.candidates,
-            store_desc,
-            path
-        );
-        for candidate in &context.candidates {
-            match self.store.get(candidate).await {
-                Ok(value) => {
-                    matched_candidate = Some(candidate.clone());
-                    log_secret_resolution(&context, &store_desc, matched_candidate.as_deref());
-                    eprintln!(
-                        "secrets_gate::DevStore matched candidate={matched_candidate:?} path={path}"
-                    );
-                    return Ok(value);
-                }
-                Err(CoreError::NotFound { .. }) => continue,
-                Err(err) => {
-                    log_secret_resolution(&context, &store_desc, matched_candidate.as_deref());
-                    return Err(map_dev_error(err));
-                }
-            }
-        }
-        log_secret_resolution(&context, &store_desc, matched_candidate.as_deref());
-        Err(SecretError::NotFound(
-            context
-                .candidates
-                .first()
-                .cloned()
-                .unwrap_or_else(|| path.to_string()),
-        ))
-    }
-
-    async fn write(&self, _: &str, _: &[u8]) -> SecretResult<()> {
-        Err(SecretError::Permission(
-            "dev secrets store is read-only".into(),
-        ))
-    }
-
-    async fn delete(&self, _: &str) -> SecretResult<()> {
-        Err(SecretError::Permission(
-            "dev secrets store is read-only".into(),
-        ))
-    }
-}
-
-fn map_dev_error(err: CoreError) -> SecretError {
-    match err {
-        CoreError::NotFound { entity } => SecretError::NotFound(entity),
-        other => SecretError::Backend(other.to_string().into()),
-    }
-}
-
-struct SecretResolutionContext {
-    env: Option<String>,
-    tenant: Option<String>,
-    team: Option<String>,
-    canonical_team: Option<String>,
-    secret_name: String,
-    candidates: Vec<String>,
-}
-
-impl SecretResolutionContext {
-    fn from_path(path: &str) -> Self {
-        let mut context = Self {
-            env: None,
-            tenant: None,
-            team: None,
-            canonical_team: None,
-            secret_name: path.to_string(),
-            candidates: vec![path.to_string()],
-        };
-        if let Some(parsed) = parse_runtime_secret_path(path) {
-            let canonical_team =
-                secrets_manager::canonical_team(Some(parsed.team.as_str())).into_owned();
-            let normalized_key = secret_name::canonical_secret_name(&parsed.secret);
-            let prefix = format!(
-                "secrets://{}/{}/{}/",
-                parsed.env, parsed.tenant, canonical_team
-            );
-            context.env = Some(parsed.env.clone());
-            context.tenant = Some(parsed.tenant.clone());
-            context.team = Some(parsed.team.clone());
-            context.canonical_team = Some(canonical_team.clone());
-            context.secret_name = normalized_key.clone();
-            const CANDIDATE_SUFFIXES: &[&str] = &[
-                "messaging",
-                "messaging-telegram",
-                "messaging.telegram.bot",
-                "messaging/telegram/bot",
-                "configs",
-            ];
-            let mut candidates = Vec::with_capacity(1 + CANDIDATE_SUFFIXES.len());
-            candidates.push(format!("{prefix}kv/{normalized_key}"));
-            for suffix in CANDIDATE_SUFFIXES {
-                candidates.push(format!("{prefix}{suffix}/{normalized_key}"));
-            }
-            context.candidates = candidates;
-        }
-        context
-    }
-}
-
-fn log_secret_resolution(ctx: &SecretResolutionContext, store_desc: &str, matched: Option<&str>) {
-    let env = ctx.env.as_deref().unwrap_or("<unknown>");
-    let tenant = ctx.tenant.as_deref().unwrap_or("<unknown>");
-    let team = ctx.team.as_deref().unwrap_or("<unknown>");
-    let canonical_team = ctx.canonical_team.as_deref().unwrap_or("<unknown>");
-    let matched_display = matched.unwrap_or("<none>");
-    operator_log::debug(
-        module_path!(),
-        format!(
-            "secrets: resolving {} store={} env={} tenant={} team={} canonical_team={} tried_keys={:?} matched_key={matched_display}",
-            ctx.secret_name, store_desc, env, tenant, team, canonical_team, ctx.candidates
-        ),
-    );
-}
-
-struct ParsedRuntimeSecretPath {
-    env: String,
-    tenant: String,
-    team: String,
-    secret: String,
-}
-
-fn parse_runtime_secret_path(path: &str) -> Option<ParsedRuntimeSecretPath> {
-    let trimmed = path.strip_prefix("secrets://")?;
-    let mut segments = trimmed.split('/');
-    let env = segments.next()?.to_string();
-    let tenant = segments.next()?.to_string();
-    let team = segments.next()?.to_string();
-    let category = segments.next()?;
-    if category != "kv" {
-        return None;
-    }
-    let remaining: Vec<&str> = segments.collect();
-    if remaining.is_empty() {
-        return None;
-    }
-    let secret = remaining.join("/");
-    Some(ParsedRuntimeSecretPath {
-        env,
-        tenant,
-        team,
-        secret,
-    })
-}
-
 /// Build the canonical secrets URI for the provided identity.
 pub fn canonical_secret_uri(
     env: &str,
@@ -334,36 +190,11 @@ fn secret_uri_candidates(
     tenant: &str,
     canonical_team: &str,
     key: &str,
-    provider_id: &str,
-    provider_type: Option<&str>,
+    pack_id: &str,
 ) -> Vec<String> {
     let normalized_key = secret_name::canonical_secret_name(key);
     let prefix = format!("secrets://{}/{}/{}/", env, tenant, canonical_team);
-    let mut candidates = Vec::new();
-    if let Some(namespace) = canonical_namespace(provider_id) {
-        candidates.push(format!("{prefix}{namespace}/{normalized_key}"));
-    }
-    if let Some(provider_type) = provider_type {
-        if let Some(namespace) = canonical_namespace(provider_type) {
-            if !namespace.is_empty() {
-                candidates.push(format!("{prefix}{namespace}/{normalized_key}"));
-            }
-        } else if !provider_type.trim().is_empty() {
-            candidates.push(format!("{prefix}{provider_type}/{normalized_key}"));
-        }
-    }
-    candidates.push(format!("{prefix}messaging/{normalized_key}"));
-    const CANDIDATE_SUFFIXES: &[&str] = &[
-        "messaging-telegram",
-        "messaging.telegram.bot",
-        "messaging/telegram/bot",
-        "configs",
-        "kv",
-    ];
-    for suffix in CANDIDATE_SUFFIXES {
-        candidates.push(format!("{prefix}{suffix}/{normalized_key}"));
-    }
-    candidates
+    vec![format!("{prefix}{pack_id}/{normalized_key}")]
 }
 
 fn display_secret_candidates(
@@ -371,36 +202,24 @@ fn display_secret_candidates(
     tenant: &str,
     canonical_team: &str,
     key: &str,
-    provider_id: &str,
-    provider_type: Option<&str>,
+    pack_id: &str,
 ) -> Vec<String> {
     let normalized_key = secret_name::canonical_secret_name(key);
     let prefix = format!("secrets://{}/{}/{}/", env, tenant, canonical_team);
-    let mut candidates = Vec::new();
-    let mut push_namespace = |namespace: &str| {
-        let trimmed = namespace.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        let candidate = format!("{prefix}{trimmed}/{normalized_key}");
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    };
-    push_namespace("messaging");
-    push_namespace(provider_id);
-    if let Some(provider_type) = provider_type {
-        push_namespace(provider_type);
+    vec![format!("{prefix}{pack_id}/{normalized_key}")]
+}
+
+fn rewrite_provider_segment(uri: &str, pack_id: &str) -> Option<String> {
+    let trimmed = uri.strip_prefix("secrets://")?;
+    let mut segments = trimmed.splitn(5, '/').collect::<Vec<_>>();
+    if segments.len() < 5 {
+        return None;
     }
-    const DISPLAY_SUFFIXES: &[&str] = &[
-        "messaging-telegram",
-        "messaging.telegram.bot",
-        "messaging/telegram/bot",
-    ];
-    for suffix in DISPLAY_SUFFIXES {
-        push_namespace(suffix);
+    if segments[3] == pack_id {
+        return None;
     }
-    candidates
+    segments[3] = pack_id;
+    Some(format!("secrets://{}", segments.join("/")))
 }
 
 fn canonical_namespace(value: &str) -> Option<String> {
@@ -420,8 +239,9 @@ pub fn check_provider_secrets(
     tenant: &str,
     team: Option<&str>,
     pack_path: &Path,
+    pack_id: &str,
     provider_id: &str,
-    provider_type: Option<&str>,
+    _provider_type: Option<&str>,
     store_path: Option<&Path>,
     using_env_fallback: bool,
 ) -> anyhow::Result<Option<Vec<String>>> {
@@ -442,6 +262,9 @@ pub fn check_provider_secrets(
                 "<default dev store>".to_string()
             }
         });
+    let store_path_display = store_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
 
     let runtime = Builder::new_current_thread()
         .enable_all()
@@ -450,26 +273,46 @@ pub fn check_provider_secrets(
     runtime.block_on(async {
         let mut missing = Vec::new();
         for key in keys {
+            let normalized_key = secret_name::canonical_secret_name(&key);
             let candidates = secret_uri_candidates(
                 env,
                 tenant,
                 &canonical_team_owned,
                 &key,
-                provider_id,
-                provider_type,
+                pack_id,
             );
             let display_candidates = display_secret_candidates(
                 env,
                 tenant,
                 &canonical_team_owned,
                 &key,
-                provider_id,
-                provider_type,
+                pack_id,
             );
+            if !display_candidates.is_empty() {
+                let candidate_list = display_candidates
+                    .iter()
+                    .map(|uri| format!("  - {}", uri))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                info!(
+                    target: "secrets",
+                    "checked secret URIs (store={} dev_store_path={}):\n{}",
+                    store_desc,
+                    store_path_display,
+                    candidate_list
+                );
+            }
             let mut resolved = false;
             let mut candidate_missing = Vec::new();
             let mut matched_uri: Option<String> = None;
             for uri in &candidates {
+                info!(
+                    target: "secrets",
+                    "secret lookup: uri={} secret_key={} dev_store_path={}",
+                    uri,
+                    normalized_key,
+                    store_path_display
+                );
                 match manager.read(uri).await {
                     Ok(_) => {
                         resolved = true;
@@ -667,7 +510,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use greentic_secrets_lib::Result as SecretResult;
-    use greentic_secrets_lib::core::seed::{ApplyOptions, apply_seed};
+    use greentic_secrets_lib::core::seed::{ApplyOptions, DevStore, apply_seed};
     use greentic_secrets_lib::{SecretFormat, SeedDoc, SeedEntry, SeedValue};
     use std::collections::HashMap;
     use std::env;
@@ -726,6 +569,7 @@ mod tests {
             Some("default"),
             &telegram_pack_path(),
             "messaging-telegram",
+            "messaging-telegram",
             Some("messaging.telegram.bot"),
             None,
             false,
@@ -733,10 +577,7 @@ mod tests {
         assert_eq!(
             result,
             Some(vec![
-                "secrets://demo/tenant/_/messaging/telegram_bot_token".to_string(),
-                "secrets://demo/tenant/_/messaging-telegram/telegram_bot_token".to_string(),
-                "secrets://demo/tenant/_/messaging.telegram.bot/telegram_bot_token".to_string(),
-                "secrets://demo/tenant/_/messaging/telegram/bot/telegram_bot_token".to_string(),
+                "secrets://demo/tenant/_/messaging-telegram/telegram_bot_token".to_string()
             ])
         );
         Ok(())
@@ -746,7 +587,7 @@ mod tests {
     fn provider_secrets_pass_when_supplied() -> anyhow::Result<()> {
         let mut values = HashMap::new();
         values.insert(
-            "secrets://demo/tenant/_/messaging/telegram_bot_token".to_string(),
+            "secrets://demo/tenant/_/messaging-telegram/telegram_bot_token".to_string(),
             b"token".to_vec(),
         );
         let manager: DynSecretsManager = Arc::new(FakeManager::new(values));
@@ -756,6 +597,7 @@ mod tests {
             "tenant",
             None,
             &telegram_pack_path(),
+            "messaging-telegram",
             "messaging-telegram",
             Some("messaging.telegram.bot"),
             None,
@@ -798,6 +640,7 @@ mod tests {
             Some("default"),
             &telegram_pack_path(),
             "messaging-telegram",
+            "messaging-telegram",
             Some("messaging.telegram.bot"),
             handle.dev_store_path.as_deref(),
             handle.using_env_fallback,
@@ -813,7 +656,7 @@ mod tests {
         let store = DevStore::with_path(store_path.clone())?;
         let seed = SeedDoc {
             entries: vec![SeedEntry {
-                uri: "secrets://demo/3point/_/messaging/telegram_bot_token".to_string(),
+                uri: "secrets://demo/3point/_/messaging-telegram/telegram_bot_token".to_string(),
                 format: SecretFormat::Text,
                 value: SeedValue::Text {
                     text: "XYZ".to_string(),
@@ -839,11 +682,49 @@ mod tests {
             Some("default"),
             &telegram_pack_path(),
             "messaging-telegram",
+            "messaging-telegram",
             Some("messaging.telegram.bot"),
             handle.dev_store_path.as_deref(),
             handle.using_env_fallback,
         )?;
         assert!(missing.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_handle_reads_dev_store_secret() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let store = DevStore::with_path(store_path.clone())?;
+        let seed = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: "secrets://demo/3point/_/messaging-telegram/telegram_bot_token".to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "token".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let runtime = Runtime::new()?;
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 1);
+        unsafe {
+            env::set_var("GREENTIC_DEV_SECRETS_PATH", store_path.clone());
+        }
+        let handle = resolve_secrets_manager(dir.path(), "demo", Some("default"))?;
+        unsafe {
+            env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+        }
+        let value = runtime.block_on(async {
+            handle
+                .manager()
+                .read("secrets://demo/3point/_/messaging-telegram/telegram_bot_token")
+                .await
+        })?;
+        assert_eq!(value, b"token".to_vec());
+        assert_eq!(handle.dev_store_path.as_deref(), Some(store_path.as_path()));
         Ok(())
     }
 }

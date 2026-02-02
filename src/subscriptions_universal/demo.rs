@@ -28,7 +28,7 @@ pub fn build_runner(
         bundle.to_path_buf(),
         &discovery,
         None,
-        secrets_handle.manager(),
+        secrets_handle.clone(),
         false,
     )?;
     let context = OperatorContext {

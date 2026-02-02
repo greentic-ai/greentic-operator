@@ -34,13 +34,16 @@ use crate::dev_mode::{
 use crate::discovery;
 use crate::domains::{self, Domain, DomainAction};
 use crate::gmap::{self, Policy};
-use crate::messaging_universal::{ProviderPayloadV1, egress};
+use crate::messaging_universal::{
+    dto::{EncodeInV1, EncodeOutV1, RenderPlanOutV1, SendPayloadOutV1},
+    egress,
+};
 use crate::operator_log;
 use crate::project::{self, ScanFormat};
 use crate::runner_exec;
 use crate::runner_integration;
 use crate::runtime_state::RuntimePaths;
-use crate::secrets_gate::{self, DynSecretsManager};
+use crate::secrets_gate::{self, DynSecretsManager, SecretsManagerHandle};
 use crate::secrets_manager;
 use crate::settings;
 use crate::setup_input::{SetupInputAnswers, collect_setup_answers, load_setup_input};
@@ -142,6 +145,8 @@ enum DemoSubcommand {
     Forbid(DemoPolicyArgs),
     #[command(about = "Manage demo subscriptions via provider components")]
     Subscriptions(DemoSubscriptionsCommand),
+    #[command(about = "Forward secrets commands to greentic-secrets with demo defaults")]
+    Secrets(DevSecretsCommand),
 }
 
 #[derive(Parser)]
@@ -1094,7 +1099,7 @@ impl DemoSubscriptionsEnsureArgs {
             bundle.clone(),
             &discovery,
             None,
-            secrets_handle.manager(),
+            secrets_handle.clone(),
             false,
         )?;
         let context = OperatorContext {
@@ -1449,6 +1454,7 @@ impl DemoCommand {
             DemoSubcommand::Doctor(args) => args.run(ctx),
             DemoSubcommand::Allow(args) => args.run(Policy::Public),
             DemoSubcommand::Forbid(args) => args.run(Policy::Forbidden),
+            DemoSubcommand::Secrets(args) => args.run(&ctx.settings),
             DemoSubcommand::Subscriptions(args) => args.run(),
         }
     }
@@ -2121,6 +2127,8 @@ impl DemoUpArgs {
             };
             let mut ingress_server = None;
             if start_result.is_ok() {
+                let ingress_secrets_handle =
+                    secrets_gate::resolve_secrets_manager(&bundle, &tenant, self.team.as_deref())?;
                 match start_demo_ingress_server(
                     &bundle,
                     &discovery,
@@ -2128,6 +2136,7 @@ impl DemoUpArgs {
                     &domains_to_setup,
                     self.runner_binary.clone(),
                     debug_enabled,
+                    ingress_secrets_handle.clone(),
                 ) {
                     Ok(server) => {
                         println!(
@@ -2503,7 +2512,7 @@ impl DemoSendArgs {
             self.bundle.clone(),
             &discovery,
             self.runner_binary.clone(),
-            secrets_handle.manager(),
+            secrets_handle.clone(),
             false,
         )?;
         let env = self.env.clone();
@@ -2613,6 +2622,7 @@ impl DemoSendArgs {
             ));
         }
         config_gate::log_config_gate(Domain::Messaging, &self.tenant, team, &env, &config_items);
+        let channel = provider_channel(&self.provider);
         let message = build_demo_send_message(
             &text,
             &args,
@@ -2620,58 +2630,55 @@ impl DemoSendArgs {
             team,
             &self.to,
             self.to_kind.as_deref(),
+            &self.provider,
+            &channel,
         );
+        debug_print_envelope("initial message", &message);
 
         // Compose a message plan and encode payload directly against the provider component (no flow resolution).
+        let render_plan_input = egress::build_render_plan_input(message.clone());
+        let render_plan_input_value = serde_json::to_value(&render_plan_input)?;
         let plan_value = run_provider_component_op_json(
             &runner_host,
             &pack,
             &provider_id,
             &context,
             "render_plan",
-            serde_json::to_value(egress::build_render_plan_input(message.clone()))?,
+            render_plan_input_value.clone(),
         )
         .with_context(|| "render_plan failed")?;
-        let encode_input = egress::build_encode_input(message.clone(), plan_value.clone());
+        let render_plan_out: RenderPlanOutV1 =
+            serde_json::from_value(plan_value).context("render_plan output invalid")?;
+        debug_print_render_plan_output(&render_plan_out);
+        if !render_plan_out.ok {
+            let err = render_plan_out
+                .error
+                .unwrap_or_else(|| "render_plan returned error".to_string());
+            return Err(anyhow::anyhow!(err));
+        }
+        let encode_input = egress::build_encode_input(message.clone(), render_plan_input_value);
+        debug_print_encode_input(&encode_input);
         let payload_value = run_provider_component_op_json(
             &runner_host,
             &pack,
             &provider_id,
             &context,
             "encode",
-            serde_json::to_value(encode_input)?,
+            serde_json::to_value(&encode_input)?,
         )
         .with_context(|| "encode failed")?;
-        let payload = match parse_provider_payload(payload_value) {
-            Ok(value) => value,
-            Err(err) => {
-                operator_log::warn(
-                    module_path!(),
-                    format!("encode output invalid: {err}; using fallback payload"),
-                );
-                let mut fallback_body = serde_json::Map::new();
-                if let JsonValue::Object(ref envelope) = message {
-                    if let Some(JsonValue::String(text)) = envelope.get("text") {
-                        fallback_body.insert("text".to_string(), JsonValue::String(text.clone()));
-                    }
-                    if let Some(JsonValue::Object(metadata)) = envelope.get("metadata") {
-                        for (key, value) in metadata {
-                            fallback_body.insert(key.clone(), value.clone());
-                        }
-                    }
-                }
-                if fallback_body.is_empty() {
-                    fallback_body.insert("text".to_string(), JsonValue::String(text.clone()));
-                }
-                let body_value = JsonValue::Object(fallback_body);
-                let body_bytes = serde_json::to_vec(&body_value)?;
-                ProviderPayloadV1 {
-                    content_type: "application/json".to_string(),
-                    body_b64: general_purpose::STANDARD.encode(&body_bytes),
-                    metadata_json: Some(serde_json::to_string(&body_value)?),
-                }
-            }
-        };
+        let encode_out: EncodeOutV1 =
+            serde_json::from_value(payload_value).context("encode output invalid")?;
+        debug_print_encode_output(&encode_out);
+        if !encode_out.ok {
+            let err = encode_out
+                .error
+                .unwrap_or_else(|| "encode returned error".to_string());
+            return Err(anyhow::anyhow!(err));
+        }
+        let payload = encode_out
+            .payload
+            .ok_or_else(|| anyhow::anyhow!("encode output missing payload"))?;
         let send_input = egress::build_send_payload(
             payload,
             self.tenant.clone(),
@@ -2695,13 +2702,25 @@ impl DemoSendArgs {
         .context("send_payload failed")?;
         println!("ok");
         if let Some(value) = send_outcome.output {
-            let missing_keys = if payload_contains_secret_error(&value) {
-                gather_missing_secret_keys(
+            if let Ok(parsed) = serde_json::from_value::<SendPayloadOutV1>(value.clone()) {
+                debug_print_send_payload_output(&parsed);
+            } else if demo_debug_enabled() {
+                if let Ok(body) = serde_json::to_string_pretty(&value) {
+                    println!(
+                        "[demo] after send_payload output: failed to parse SendPayloadOutV1\n{body}"
+                    );
+                } else {
+                    println!("[demo] after send_payload output: invalid JSON output");
+                }
+            }
+            let missing_uris = if payload_contains_secret_error(&value) {
+                gather_missing_secret_uris(
                     &secrets_handle.manager(),
                     &env,
                     &self.tenant,
                     team,
                     &pack.path,
+                    &pack.pack_id,
                     &provider_id,
                     secrets_handle.dev_store_path.as_deref(),
                     secrets_handle.using_env_fallback,
@@ -2710,6 +2729,16 @@ impl DemoSendArgs {
             } else {
                 Vec::new()
             };
+            if !missing_uris.is_empty() {
+                println!(
+                    "missing secret URIs:\n{}",
+                    missing_uris
+                        .iter()
+                        .map(|uri| format!("  - {uri}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
             let enriched = enrich_secret_error_payload(
                 value,
                 &context,
@@ -2717,7 +2746,7 @@ impl DemoSendArgs {
                 &provider_type,
                 &pack.pack_id,
                 &pack.path,
-                &missing_keys,
+                &missing_uris,
                 &secrets_handle.selection,
                 secrets_handle.dev_store_path.as_deref(),
             );
@@ -2771,7 +2800,7 @@ fn enrich_secret_error_payload(
     provider_type: &str,
     pack_id: &str,
     pack_path: &Path,
-    missing_keys: &[String],
+    missing_uris: &[String],
     selection: &secrets_manager::SecretsManagerSelection,
     dev_store_path: Option<&Path>,
 ) -> serde_json::Value {
@@ -2797,7 +2826,7 @@ fn enrich_secret_error_payload(
                 && let Some(text) = entry.as_str()
                 && text_contains_secret_error(text)
             {
-                let suffix = secret_error_suffix(&context_suffix, missing_keys);
+                let suffix = secret_error_suffix(&context_suffix, missing_uris);
                 let enriched = format!("{text} ({suffix})");
                 *entry = serde_json::Value::String(enriched);
             }
@@ -2822,22 +2851,23 @@ fn text_contains_secret_error(text: &str) -> bool {
     lower.contains("secret store error") || text.contains("SecretsError")
 }
 
-fn secret_error_suffix(context_suffix: &str, missing_keys: &[String]) -> String {
-    if missing_keys.is_empty() {
+fn secret_error_suffix(context_suffix: &str, missing_uris: &[String]) -> String {
+    if missing_uris.is_empty() {
         context_suffix.to_string()
     } else {
-        let missing = missing_keys.join(", ");
+        let missing = missing_uris.join(", ");
         format!("{context_suffix}; missing secrets: {missing}")
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn gather_missing_secret_keys(
+fn gather_missing_secret_uris(
     manager: &DynSecretsManager,
     env: &str,
     tenant: &str,
     team: Option<&str>,
     pack_path: &Path,
+    pack_id: &str,
     provider_id: &str,
     store_path: Option<&Path>,
     using_env_fallback: bool,
@@ -2849,15 +2879,13 @@ fn gather_missing_secret_keys(
         tenant,
         team,
         pack_path,
+        pack_id,
         provider_id,
         provider_type,
         store_path,
         using_env_fallback,
     ) {
-        Ok(Some(missing)) => missing
-            .into_iter()
-            .map(extract_secret_key_from_uri)
-            .collect(),
+        Ok(Some(missing)) => missing,
         Ok(None) => Vec::new(),
         Err(err) => {
             operator_log::warn(
@@ -2870,21 +2898,6 @@ fn gather_missing_secret_keys(
             Vec::new()
         }
     }
-}
-
-fn extract_secret_key_from_uri(uri: String) -> String {
-    uri.rsplit('/')
-        .next()
-        .map(|segment| segment.to_string())
-        .unwrap_or(uri)
-}
-
-fn parse_provider_payload(mut value: JsonValue) -> anyhow::Result<ProviderPayloadV1> {
-    if let JsonValue::Object(ref mut map) = value {
-        map.entry("content_type")
-            .or_insert_with(|| JsonValue::String("application/json".to_string()));
-    }
-    serde_json::from_value(value).context("provider payload is invalid")
 }
 
 fn ensure_provider_op_success(
@@ -2960,7 +2973,7 @@ impl DemoReceiveArgs {
             self.bundle.clone(),
             &discovery,
             self.runner_binary.clone(),
-            secrets_handle.manager(),
+            secrets_handle.clone(),
             false,
         )?);
         let context = OperatorContext {
@@ -3113,6 +3126,11 @@ impl DemoIngressArgs {
             team: team_context,
             correlation_id: self.correlation_id.clone(),
         };
+        let secrets_handle = secrets_gate::resolve_secrets_manager(
+            &self.bundle,
+            &self.tenant,
+            context.team.as_deref(),
+        )?;
 
         let (response, events) = crate::messaging_universal::ingress::run_ingress(
             &self.bundle,
@@ -3120,7 +3138,7 @@ impl DemoIngressArgs {
             &request,
             &context,
             self.runner_binary.clone(),
-            secrets_gate::default_manager(),
+            secrets_handle.clone(),
         )?;
 
         if self.print.should_print_http() {
@@ -3141,7 +3159,7 @@ impl DemoIngressArgs {
                 self.send,
                 self.dry_run,
                 self.retries.unwrap_or(0),
-                secrets_gate::default_manager(),
+                secrets_handle.clone(),
             )?;
         }
 
@@ -3652,6 +3670,7 @@ fn start_demo_ingress_server(
     domains: &[Domain],
     runner_binary: Option<PathBuf>,
     debug_enabled: bool,
+    secrets_handle: SecretsManagerHandle,
 ) -> anyhow::Result<HttpIngressServer> {
     let addr = format!(
         "{}:{}",
@@ -3664,7 +3683,7 @@ fn start_demo_ingress_server(
         bundle.to_path_buf(),
         discovery,
         runner_binary,
-        secrets_gate::default_manager(),
+        secrets_handle.clone(),
         debug_enabled,
     )?);
     HttpIngressServer::start(HttpIngressConfig {
@@ -4513,6 +4532,7 @@ fn run_plan_item(
             tenant,
             team,
             &item.pack.path,
+            &item.pack.pack_id,
             &provider_id,
             None,
             None,
@@ -4992,6 +5012,8 @@ fn build_demo_send_message(
     team: Option<&str>,
     destinations: &[String],
     to_kind: Option<&str>,
+    provider_id: &str,
+    channel: &str,
 ) -> JsonValue {
     let mut metadata = BTreeMap::new();
     for (key, value) in args {
@@ -5012,7 +5034,7 @@ fn build_demo_send_message(
         .with_session(Uuid::new_v4().to_string())
         .with_flow(Uuid::new_v4().to_string())
         .with_node("demo".to_string())
-        .with_provider("messaging-telegram")
+        .with_provider(provider_id.to_string())
         .with_attempt(1);
 
     let to_kind_owned = to_kind.map(|value| value.to_string());
@@ -5026,7 +5048,7 @@ fn build_demo_send_message(
     let envelope = ChannelMessageEnvelope {
         id: Uuid::new_v4().to_string(),
         tenant: tenant_ctx,
-        channel: "messaging.telegram".to_string(),
+        channel: channel.to_string(),
         session_id: Uuid::new_v4().to_string(),
         reply_scope: None,
         from: None,
@@ -5037,6 +5059,68 @@ fn build_demo_send_message(
         metadata,
     };
     serde_json::to_value(envelope).unwrap_or(JsonValue::Null)
+}
+
+fn debug_print_envelope(op_label: &str, envelope: &JsonValue) {
+    if !demo_debug_enabled() {
+        return;
+    }
+    match serde_json::to_string_pretty(envelope) {
+        Ok(body) => println!("[demo] before {op_label} envelope:\n{body}"),
+        Err(err) => {
+            println!("[demo] before {op_label} envelope: failed to serialize envelope: {err}")
+        }
+    }
+}
+
+fn debug_print_render_plan_output(output: &RenderPlanOutV1) {
+    if !demo_debug_enabled() {
+        return;
+    }
+    match serde_json::to_string_pretty(&output) {
+        Ok(body) => println!("[demo] after render_plan output:\n{body}"),
+        Err(err) => {
+            println!("[demo] after render_plan output: failed to serialize output: {err}")
+        }
+    }
+}
+
+fn debug_print_encode_input(input: &EncodeInV1) {
+    if !demo_debug_enabled() {
+        return;
+    }
+    match serde_json::to_string_pretty(&input) {
+        Ok(body) => println!("[demo] encode input:\n{body}"),
+        Err(err) => println!("[demo] encode input: failed to serialize input: {err}"),
+    }
+}
+
+fn debug_print_encode_output(output: &EncodeOutV1) {
+    if !demo_debug_enabled() {
+        return;
+    }
+    match serde_json::to_string_pretty(&output) {
+        Ok(body) => println!("[demo] after encode output:\n{body}"),
+        Err(err) => println!("[demo] after encode output: failed to serialize output: {err}"),
+    }
+}
+
+fn debug_print_send_payload_output(output: &SendPayloadOutV1) {
+    if !demo_debug_enabled() {
+        return;
+    }
+    match serde_json::to_string_pretty(&output) {
+        Ok(body) => println!("[demo] after send_payload output:\n{body}"),
+        Err(err) => println!("[demo] after send_payload output: failed to serialize output: {err}"),
+    }
+}
+
+fn provider_channel(provider: &str) -> String {
+    if let Some((domain, suffix)) = provider.split_once('-') {
+        format!("{domain}.{suffix}")
+    } else {
+        provider.replace('-', ".")
+    }
 }
 
 fn config_value_display(value: &JsonValue) -> String {

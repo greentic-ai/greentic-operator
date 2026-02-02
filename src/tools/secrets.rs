@@ -136,8 +136,9 @@ pub(crate) fn build_get_args(
 
 pub(crate) fn build_list_args(env: &str, tenant: &str, team: Option<&str>) -> Vec<String> {
     let mut args = build_base_args(env, tenant, team);
-    args.insert(0, "list".to_string());
-    args
+    let mut framed = vec!["admin".to_string(), "list".to_string()];
+    framed.append(&mut args);
+    framed
 }
 
 pub(crate) fn build_delete_args(
@@ -343,7 +344,21 @@ mod tests {
     #[test]
     fn build_list_args_without_team() {
         let args = build_list_args("dev", "tenant1", None);
-        assert_eq!(args, vec!["list", "--env", "dev", "--tenant", "tenant1"]);
+        assert_eq!(
+            args,
+            vec!["admin", "list", "--env", "dev", "--tenant", "tenant1"]
+        );
+    }
+
+    #[test]
+    fn build_list_args_with_team() {
+        let args = build_list_args("dev", "tenant1", Some("team1"));
+        assert_eq!(
+            args,
+            vec![
+                "admin", "list", "--env", "dev", "--tenant", "tenant1", "--team", "team1"
+            ]
+        );
     }
 
     #[test]

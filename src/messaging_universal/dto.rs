@@ -41,10 +41,33 @@ pub struct RenderPlanInV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderPlanOutPlan {
+    pub plan_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderPlanOutV1 {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<RenderPlanOutPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncodeInV1 {
     pub v: u32,
     pub message: serde_json::Value,
     pub plan: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncodeOutV1 {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<ProviderPayloadV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +85,15 @@ pub struct SendPayloadInV1 {
     pub tenant: TenantHint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_scope: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendPayloadOutV1 {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 /// Tenant/Team hints that accompany outbound requests.

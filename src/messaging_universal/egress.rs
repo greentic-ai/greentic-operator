@@ -20,7 +20,7 @@ use crate::messaging_universal::dto::{
 use crate::messaging_universal::retry::{EgressJob, RetryPolicy};
 use crate::operator_log;
 use crate::runtime_state::RuntimePaths;
-use crate::secrets_gate::DynSecretsManager;
+use crate::secrets_gate::SecretsManagerHandle;
 
 pub fn build_render_plan_input(message: serde_json::Value) -> RenderPlanInV1 {
     RenderPlanInV1 { v: 1, message }
@@ -63,7 +63,7 @@ pub fn run_end_to_end(
     send_payload_flag: bool,
     dry_run: bool,
     retries: u32,
-    secrets_manager: DynSecretsManager,
+    secrets_handle: SecretsManagerHandle,
 ) -> anyhow::Result<()> {
     if envelopes.is_empty() {
         return Ok(());
@@ -115,7 +115,7 @@ pub fn run_end_to_end(
         bundle.to_path_buf(),
         &discovery,
         runner_binary,
-        secrets_manager,
+        secrets_handle.clone(),
         false,
     )?;
     let policy = RetryPolicy {
