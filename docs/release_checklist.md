@@ -10,10 +10,10 @@ Release Checklist (greentic-operator)
    - Builds release binaries for all targets.
    - Creates/updates GitHub Release `vX.Y.Z` and uploads assets.
 5. Verify GitHub Release assets exist and are named:
-   - `greentic-operator-x86_64-unknown-linux-gnu-vX.Y.Z.tar.gz`
-   - `greentic-operator-aarch64-unknown-linux-gnu-vX.Y.Z.tar.gz`
-   - `greentic-operator-x86_64-apple-darwin-vX.Y.Z.tar.gz`
-   - `greentic-operator-aarch64-apple-darwin-vX.Y.Z.tar.gz`
+   - `greentic-operator-x86_64-unknown-linux-gnu-vX.Y.Z.tgz`
+   - `greentic-operator-aarch64-unknown-linux-gnu-vX.Y.Z.tgz`
+   - `greentic-operator-x86_64-apple-darwin-vX.Y.Z.tgz`
+   - `greentic-operator-aarch64-apple-darwin-vX.Y.Z.tgz`
    - `greentic-operator-x86_64-pc-windows-msvc-vX.Y.Z.zip`
 6. Validate cargo-binstall:
    - `cargo binstall greentic-operator --version X.Y.Z --force --no-confirm`

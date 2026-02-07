@@ -77,7 +77,7 @@ if [[ "$TARGET" == *windows* ]]; then
     exit 1
   fi
 else
-  ARCHIVE="$OUT_DIR/${ARCHIVE_PREFIX}.tar.gz"
+  ARCHIVE="$OUT_DIR/${ARCHIVE_PREFIX}.tgz"
   tar -C "$STAGING_DIR" -czf "$ARCHIVE" "$ARCHIVE_PREFIX"
 fi
 
