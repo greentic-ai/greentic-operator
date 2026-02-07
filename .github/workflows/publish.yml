@@ -36,7 +36,7 @@ jobs:
               data = tomllib.load(f)
           version = data["package"]["version"]
           tag = os.environ.get("GITHUB_REF_NAME", "")
-          if tag and tag != f"v{version}":
+          if tag.startswith("v") and tag != f"v{version}":
               print(f"Tag/version mismatch: tag={tag} Cargo.toml={version}", file=sys.stderr)
               sys.exit(1)
           print(f"version={version}")
