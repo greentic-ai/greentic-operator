@@ -240,6 +240,7 @@ fn terminate_process(pid: u32, graceful_timeout_ms: u64) -> anyhow::Result<()> {
 
     #[cfg(windows)]
     {
+        let _ = graceful_timeout_ms;
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status();

@@ -1,6 +1,5 @@
 use std::env;
 use std::fs::OpenOptions;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -223,7 +222,7 @@ fn is_process_running(pid: u32) -> anyhow::Result<bool> {
     if result == 0 {
         return Ok(true);
     }
-    let err = io::Error::last_os_error();
+    let err = std::io::Error::last_os_error();
     if err.raw_os_error() == Some(libc::ESRCH) {
         Ok(false)
     } else {
@@ -238,7 +237,7 @@ fn kill_process(pid: u32) -> anyhow::Result<()> {
     if result == 0 {
         return Ok(());
     }
-    let err = io::Error::last_os_error();
+    let err = std::io::Error::last_os_error();
     if err.raw_os_error() == Some(libc::ESRCH) {
         return Ok(());
     }
@@ -246,7 +245,7 @@ fn kill_process(pid: u32) -> anyhow::Result<()> {
     if fallback == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error().into())
+        Err(std::io::Error::last_os_error().into())
     }
 }
 

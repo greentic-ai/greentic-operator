@@ -4,11 +4,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET=""
 OUT_DIR=""
+VERSION=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target)
       TARGET="$2"
+      shift 2
+      ;;
+    --version)
+      VERSION="$2"
       shift 2
       ;;
     --out)
@@ -37,7 +42,11 @@ pushd "$ROOT_DIR" >/dev/null
 
 if [[ "$TARGET" != "$HOST_TARGET" ]]; then
   rustup target add "$TARGET"
-  cargo build --release --target "$TARGET"
+  if [[ "${USE_CROSS:-0}" == "1" ]] && command -v cross >/dev/null 2>&1; then
+    cross build --release --target "$TARGET"
+  else
+    cargo build --release --target "$TARGET"
+  fi
   BIN_DIR="target/$TARGET/release"
 else
   cargo build --release
@@ -49,8 +58,13 @@ if [[ "$TARGET" == *windows* ]]; then
   BIN_NAME="${BIN_NAME}.exe"
 fi
 
+ARCHIVE_PREFIX="greentic-operator"
+if [[ -n "$VERSION" ]]; then
+  ARCHIVE_PREFIX="greentic-operator-v${VERSION}"
+fi
+
 if [[ "$TARGET" == *windows* ]]; then
-  ARCHIVE="$OUT_DIR/greentic-operator-$TARGET.zip"
+  ARCHIVE="$OUT_DIR/${ARCHIVE_PREFIX}-${TARGET}.zip"
   if command -v 7z >/dev/null 2>&1; then
     7z a -tzip "$ARCHIVE" "$BIN_DIR/$BIN_NAME" >/dev/null
   else
@@ -58,7 +72,7 @@ if [[ "$TARGET" == *windows* ]]; then
     exit 1
   fi
 else
-  ARCHIVE="$OUT_DIR/greentic-operator-$TARGET.tar.gz"
+  ARCHIVE="$OUT_DIR/${ARCHIVE_PREFIX}-${TARGET}.tar.gz"
   tar -C "$BIN_DIR" -czf "$ARCHIVE" "$BIN_NAME"
 fi
 
