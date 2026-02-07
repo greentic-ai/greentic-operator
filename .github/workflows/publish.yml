@@ -164,7 +164,7 @@ jobs:
             echo "$output"
             exit 0
           fi
-          if echo "$output" | grep -E -q "already uploaded|version .* is already in use"; then
+          if echo "$output" | grep -E -q "already uploaded|version .* is already in use|already exists on crates.io index"; then
             echo "Warning: crate version already published; skipping." >&2
             echo "$output"
             exit 0
