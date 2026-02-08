@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 use greentic_operator::cloudflared::{CloudflaredConfig, start_quick_tunnel};
 use greentic_operator::runtime_state::RuntimePaths;
@@ -28,16 +29,7 @@ fn cloudflared_discovers_public_url() {
 }
 
 fn resolve_fake_cloudflared() -> PathBuf {
-    if let Ok(value) = std::env::var("CARGO_BIN_EXE_fake_cloudflared") {
-        return PathBuf::from(value);
-    }
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.file_name().and_then(|name| name.to_str()) == Some("deps") {
-        path.pop();
-    }
-    path.push(binary_name("fake_cloudflared"));
-    path
+    example_bin("fake_cloudflared")
 }
 
 fn binary_name(name: &str) -> String {
@@ -46,4 +38,22 @@ fn binary_name(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+fn example_bin(name: &str) -> PathBuf {
+    let mut path = std::env::current_exe().unwrap();
+    path.pop();
+    if path.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        path.pop();
+    }
+    let candidate = path.join("examples").join(binary_name(name));
+    if candidate.exists() {
+        return candidate;
+    }
+    let status = Command::new("cargo")
+        .args(["build", "--example", name])
+        .status()
+        .expect("failed to build example binary");
+    assert!(status.success(), "failed to build example binary");
+    candidate
 }

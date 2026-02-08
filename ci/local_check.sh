@@ -62,7 +62,7 @@ fi
 
 PACKAGE_OUT="$(mktemp -d)"
 HOST_TARGET="$(rustc -vV | rg "^host:" | awk '{print $2}')"
-VERSION="$(python - <<'PY'
+VERSION="$(python3 - <<'PY'
 import tomllib
 with open("Cargo.toml", "rb") as f:
     data = tomllib.load(f)
