@@ -83,6 +83,7 @@ pub fn qa_mode_for_flow(flow_id: &str) -> Option<QaMode> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_answers_via_component_qa(
     root: &Path,
     domain: Domain,

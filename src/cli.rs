@@ -5072,23 +5072,22 @@ fn run_plan_item(
             if let Some(config_value) = qa_config_override
                 .clone()
                 .or_else(|| extract_config_for_envelope(output.parsed.as_ref()))
-            {
-                if let Err(err) = crate::provider_config_envelope::write_provider_config_envelope(
+                && let Err(err) = crate::provider_config_envelope::write_provider_config_envelope(
                     &providers_root,
                     &provider_id,
                     &item.flow_id,
                     &config_value,
                     &item.pack.path,
                     backup,
-                ) {
-                    operator_log::warn(
-                        module_path!(),
-                        format!(
-                            "failed to write provider config envelope provider={} flow={}: {err}",
-                            provider_id, item.flow_id
-                        ),
-                    );
-                }
+                )
+            {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to write provider config envelope provider={} flow={}: {err}",
+                        provider_id, item.flow_id
+                    ),
+                );
             }
         }
         let exit = format_runner_exit(&output);
@@ -5141,23 +5140,21 @@ fn run_plan_item(
             )?;
             if let Some(config_value) = qa_config_override.clone().or_else(|| {
                 extract_config_for_envelope(serde_json::to_value(&output.result).ok().as_ref())
-            }) {
-                if let Err(err) = crate::provider_config_envelope::write_provider_config_envelope(
-                    &providers_root,
-                    &provider_id,
-                    &item.flow_id,
-                    &config_value,
-                    &item.pack.path,
-                    backup,
-                ) {
-                    operator_log::warn(
-                        module_path!(),
-                        format!(
-                            "failed to write provider config envelope provider={} flow={}: {err}",
-                            provider_id, item.flow_id
-                        ),
-                    );
-                }
+            }) && let Err(err) = crate::provider_config_envelope::write_provider_config_envelope(
+                &providers_root,
+                &provider_id,
+                &item.flow_id,
+                &config_value,
+                &item.pack.path,
+                backup,
+            ) {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to write provider config envelope provider={} flow={}: {err}",
+                        provider_id, item.flow_id
+                    ),
+                );
             }
         }
         println!(

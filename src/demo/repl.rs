@@ -219,17 +219,16 @@ fn humanize_output(value: &JsonValue) -> JsonValue {
         JsonValue::Object(map) => {
             let mut updated = serde_json::Map::new();
             for (key, value) in map {
-                if key == "metadata" || key == "payload" {
-                    if let Some(bytes) = json_array_to_bytes(value) {
-                        if let Ok(text) = String::from_utf8(bytes) {
-                            if let Ok(parsed) = serde_json::from_str::<JsonValue>(&text) {
-                                updated.insert(key.clone(), parsed);
-                                continue;
-                            }
-                            updated.insert(key.clone(), JsonValue::String(text));
-                            continue;
-                        }
+                if (key == "metadata" || key == "payload")
+                    && let Some(bytes) = json_array_to_bytes(value)
+                    && let Ok(text) = String::from_utf8(bytes)
+                {
+                    if let Ok(parsed) = serde_json::from_str::<JsonValue>(&text) {
+                        updated.insert(key.clone(), parsed);
+                        continue;
                     }
+                    updated.insert(key.clone(), JsonValue::String(text));
+                    continue;
                 }
                 updated.insert(key.clone(), humanize_output(value));
             }
