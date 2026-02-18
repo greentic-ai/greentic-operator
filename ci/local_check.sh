@@ -12,7 +12,7 @@ pushd "$ROOT_DIR" >/dev/null
 echo "[local_check] cargo fmt --check"
 cargo fmt --check
 echo "[local_check] cargo clippy"
-cargo clippy
+cargo clippy -- -D warnings
 echo "[local_check] cargo test"
 cargo test
 

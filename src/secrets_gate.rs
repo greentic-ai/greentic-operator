@@ -620,8 +620,7 @@ mod tests {
     use greentic_secrets_lib::core::seed::{ApplyOptions, DevStore, apply_seed};
     use greentic_secrets_lib::{SecretFormat, SeedDoc, SeedEntry, SeedValue};
     use once_cell::sync::Lazy;
-    use rand::TryRngCore;
-    use rand::rngs::OsRng;
+    use rand::RngExt;
     use std::collections::HashMap;
     use std::env;
     use std::fs;
@@ -990,7 +989,7 @@ mod tests {
 
     fn random_secret_value() -> String {
         let mut bytes = [0u8; 32];
-        OsRng.try_fill_bytes(&mut bytes).expect("OsRng fill failed");
+        rand::rng().fill(&mut bytes);
         let encoded = URL_SAFE_NO_PAD.encode(bytes);
         format!("TEST_OPAQUE_{encoded}")
     }

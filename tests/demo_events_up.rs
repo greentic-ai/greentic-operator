@@ -25,7 +25,7 @@ fn write_pack(path: &std::path::Path, pack_id: &str) -> anyhow::Result<()> {
 }
 
 #[test]
-fn demo_up_starts_events_services_when_events_packs_exist() {
+fn demo_up_uses_in_process_events_when_events_packs_exist() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     std::fs::create_dir_all(root.join("providers").join("events")).unwrap();
@@ -107,10 +107,18 @@ services:
 
     assert!(root.join("state").exists(), "state dir missing");
     let paths = RuntimePaths::new(root.join("state"), "demo", "default");
-    assert!(paths.pid_path("events-ingress").exists());
-    assert!(paths.pid_path("events-worker").exists());
-    let _ = supervisor::stop_pidfile(&paths.pid_path("events-ingress"), 1_000);
-    let _ = supervisor::stop_pidfile(&paths.pid_path("events-worker"), 1_000);
+    assert!(
+        !paths.pid_path("events-ingress").exists(),
+        "events-ingress should not run as external process"
+    );
+    assert!(
+        !paths.pid_path("events-worker").exists(),
+        "events-worker should not run as external process"
+    );
+    let _ = supervisor::stop_pidfile(&paths.pid_path("subscriptions"), 1_000);
+    let _ = supervisor::stop_pidfile(&paths.pid_path("egress"), 1_000);
+    let _ = supervisor::stop_pidfile(&paths.pid_path("gateway"), 1_000);
+    let _ = supervisor::stop_pidfile(&paths.pid_path("nats"), 1_000);
 }
 
 fn fake_bin(name: &str) -> PathBuf {

@@ -13,10 +13,11 @@ use hyper_util::rt::tokio::TokioIo;
 use serde_json::json;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 
+use crate::demo::event_router::route_events_to_default_flow;
+use crate::demo::ingress_dispatch::dispatch_http_ingress;
+use crate::demo::ingress_types::{IngressHttpResponse, IngressRequestV1};
 use crate::demo::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::domains::{self, Domain};
-use crate::messaging_universal::dto::HttpOutV1;
-use crate::messaging_universal::ingress::{build_ingress_request, run_ingress};
 use crate::operator_log;
 
 #[derive(Clone)]
@@ -156,40 +157,26 @@ async fn handle_request_inner(
     }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let segments = req
-        .uri()
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.len() < 4 || !segments[1].eq_ignore_ascii_case("ingress") {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "expected /{domain}/ingress/{provider}/{tenant}/{team?}",
-        ));
-    }
-    let domain = match parse_domain(segments[0]) {
+    let parsed = match parse_route_segments(req.uri().path()) {
         Some(value) => value,
-        None => return Err(error_response(StatusCode::NOT_FOUND, "unknown domain")),
+        None => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "expected /v1/{domain}/ingress/{provider}/{tenant}/{team?}/{handler?}",
+            ));
+        }
     };
+    let domain = parsed.domain;
     if !state.domains.contains(&domain) {
         return Err(error_response(StatusCode::NOT_FOUND, "domain disabled"));
     }
-    let provider = segments[2].to_string();
-    let tenant = segments[3].to_string();
-    let team = segments
-        .get(4)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "default".to_string());
     if !state
         .runner_host
-        .supports_op(domain, &provider, "ingest_http")
+        .supports_op(domain, &parsed.provider, "ingest_http")
     {
         return Err(error_response(
             StatusCode::NOT_FOUND,
-            "no ingress flow available",
+            "no ingest_http handler available",
         ));
     }
 
@@ -207,22 +194,9 @@ async fn handle_request_inner(
         .map(|collected| collected.to_bytes())
         .unwrap_or_default();
 
-    let request = build_ingress_request(
-        &provider,
-        None,
-        method.as_str(),
-        &path,
-        headers,
-        queries,
-        &payload_bytes,
-        None,
-        Some(tenant.clone()),
-        Some(team.clone()),
-    );
-
     let context = OperatorContext {
-        tenant: tenant.clone(),
-        team: Some(team.clone()),
+        tenant: parsed.tenant.clone(),
+        team: Some(parsed.team.clone()),
         correlation_id: correlation_id.clone(),
     };
     let debug_enabled = state.runner_host.debug_enabled();
@@ -234,7 +208,7 @@ async fn handle_request_inner(
                 method,
                 path,
                 domains::domain_name(domain),
-                provider,
+                parsed.provider,
                 context.tenant,
                 context.team.as_deref().unwrap_or("default"),
                 context.correlation_id.as_deref().unwrap_or("none"),
@@ -243,26 +217,44 @@ async fn handle_request_inner(
         );
     }
 
-    let (response, events) = run_ingress(
-        state.runner_host.bundle_root(),
-        &provider,
-        &request,
+    let ingress_request = IngressRequestV1 {
+        v: 1,
+        domain: domains::domain_name(domain).to_string(),
+        provider: parsed.provider.clone(),
+        handler: parsed.handler.clone(),
+        tenant: parsed.tenant.clone(),
+        team: Some(parsed.team.clone()),
+        method: method.as_str().to_string(),
+        path: path.clone(),
+        query: queries,
+        headers,
+        body: payload_bytes.to_vec(),
+        correlation_id: correlation_id.clone(),
+        remote_addr: None,
+    };
+
+    let result = dispatch_http_ingress(
+        state.runner_host.as_ref(),
+        domain,
+        &ingress_request,
         &context,
-        None,
-        state.runner_host.secrets_handle().clone(),
     )
     .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
-    if !events.is_empty() {
+    if !result.events.is_empty() {
         operator_log::info(
             module_path!(),
             format!(
                 "[demo ingress] parsed {} event(s) from provider={} tenant={} team={}",
-                events.len(),
-                provider,
-                tenant,
-                team
+                result.events.len(),
+                parsed.provider,
+                parsed.tenant,
+                parsed.team
             ),
         );
+    }
+    if domain == Domain::Events && !result.events.is_empty() {
+        route_events_to_default_flow(state.runner_host.bundle_root(), &context, &result.events)
+            .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
     }
 
     if debug_enabled {
@@ -271,31 +263,37 @@ async fn handle_request_inner(
             format!(
                 "[demo dev] ingress outcome domain={} provider={} tenant={} team={} corr_id={:?} events={}",
                 domains::domain_name(domain),
-                provider,
+                parsed.provider,
                 context.tenant,
                 context.team.as_deref().unwrap_or("default"),
                 correlation_id.as_deref().unwrap_or("none"),
-                events.len(),
+                result.events.len(),
             ),
         );
     }
 
-    build_http_response(&response)
+    build_http_response(&result.response)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
 }
 
-fn build_http_response(response: &HttpOutV1) -> Result<Response<Full<Bytes>>, String> {
+fn build_http_response(response: &IngressHttpResponse) -> Result<Response<Full<Bytes>>, String> {
     let mut builder = Response::builder().status(response.status);
-    builder = builder.header(CONTENT_TYPE, "application/json");
+    let mut has_content_type = false;
     for (name, value) in &response.headers {
         if let (Ok(header_name), Ok(header_value)) = (
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(value),
         ) {
+            if header_name == CONTENT_TYPE {
+                has_content_type = true;
+            }
             builder = builder.header(header_name, header_value);
         }
     }
-    let body = serde_json::to_string(response).map_err(|err| err.to_string())?;
+    if !has_content_type {
+        builder = builder.header(CONTENT_TYPE, "application/json");
+    }
+    let body = response.body.clone().unwrap_or_default();
     builder
         .body(Full::from(Bytes::from(body)))
         .map_err(|err| err.to_string())
@@ -341,6 +339,66 @@ fn parse_domain(value: &str) -> Option<Domain> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ParsedIngressRoute {
+    domain: Domain,
+    provider: String,
+    tenant: String,
+    team: String,
+    handler: Option<String>,
+}
+
+fn parse_route_segments(path: &str) -> Option<ParsedIngressRoute> {
+    let segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return None;
+    }
+    if segments[0].eq_ignore_ascii_case("v1") {
+        return parse_v1_route(&segments);
+    }
+    parse_legacy_route(&segments)
+}
+
+fn parse_v1_route(segments: &[&str]) -> Option<ParsedIngressRoute> {
+    if segments.len() < 5 || !segments[2].eq_ignore_ascii_case("ingress") {
+        return None;
+    }
+    let domain = parse_domain(segments[1])?;
+    let provider = segments[3].to_string();
+    let tenant = segments[4].to_string();
+    let team = segments.get(5).copied().unwrap_or("default").to_string();
+    let handler = segments.get(6).map(|value| (*value).to_string());
+    Some(ParsedIngressRoute {
+        domain,
+        provider,
+        tenant,
+        team,
+        handler,
+    })
+}
+
+fn parse_legacy_route(segments: &[&str]) -> Option<ParsedIngressRoute> {
+    if segments.len() < 4 || !segments[1].eq_ignore_ascii_case("ingress") {
+        return None;
+    }
+    let domain = parse_domain(segments[0])?;
+    let provider = segments[2].to_string();
+    let tenant = segments[3].to_string();
+    let team = segments.get(4).copied().unwrap_or("default").to_string();
+    let handler = segments.get(5).map(|value| (*value).to_string());
+    Some(ParsedIngressRoute {
+        domain,
+        provider,
+        tenant,
+        team,
+        handler,
+    })
+}
+
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response<Full<Bytes>> {
     let body = json!({
         "success": false,
@@ -363,4 +421,28 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Full<
                 ))))
                 .unwrap()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_v1_route_with_optional_segments() {
+        let parsed = parse_route_segments("/v1/events/ingress/provider-a/tenant-x/team-y/h1")
+            .expect("route should parse");
+        assert_eq!(parsed.domain, Domain::Events);
+        assert_eq!(parsed.provider, "provider-a");
+        assert_eq!(parsed.tenant, "tenant-x");
+        assert_eq!(parsed.team, "team-y");
+        assert_eq!(parsed.handler.as_deref(), Some("h1"));
+    }
+
+    #[test]
+    fn parses_legacy_route_for_compatibility() {
+        let parsed = parse_route_segments("/messaging/ingress/provider-a/tenant-x")
+            .expect("route should parse");
+        assert_eq!(parsed.domain, Domain::Messaging);
+        assert_eq!(parsed.team, "default");
+    }
 }

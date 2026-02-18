@@ -4,7 +4,7 @@ use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use greentic_types::ChannelMessageEnvelope;
-use rand::{Rng, rng};
+use rand::{RngExt, rng};
 use serde_json::{Value as JsonValue, json};
 use std::path::{Path, PathBuf};
 use std::thread;

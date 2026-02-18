@@ -390,7 +390,6 @@ pub fn demo_up(
     nats_mode: NatsMode,
     messaging_enabled: bool,
     cloudflared: Option<CloudflaredConfig>,
-    events_components: Vec<crate::services::ComponentSpec>,
     log_dir: &Path,
     debug_enabled: bool,
 ) -> anyhow::Result<()> {
@@ -403,16 +402,11 @@ pub fn demo_up(
     let restart_targets = BTreeSet::new();
     let mut public_base_url: Option<String> = None;
     if debug_enabled {
-        let component_ids = events_components
-            .iter()
-            .map(|component| component.id.clone())
-            .collect::<Vec<_>>()
-            .join(",");
         operator_log::debug(
             module_path!(),
             format!(
-                "[demo dev] demo_up tenant={} team={} nats_mode={:?} messaging_enabled={} events_components=[{}]",
-                tenant, team_id, nats_mode, messaging_enabled, component_ids
+                "[demo dev] demo_up tenant={} team={} nats_mode={:?} messaging_enabled={}",
+                tenant, team_id, nats_mode, messaging_enabled
             ),
         );
     }
@@ -551,33 +545,7 @@ pub fn demo_up(
         println!("messaging: running embedded runner (no gsm gateway/egress)");
     }
 
-    if !events_components.is_empty() && resolved_nats_url.is_some() {
-        let envs = build_env_kv(tenant, team, resolved_nats_url.as_deref());
-        for component in events_components {
-            if debug_enabled {
-                operator_log::debug(
-                    module_path!(),
-                    format!(
-                        "[demo dev] starting event component id={} binary={} args={:?} envs={:?}",
-                        component.id, component.binary, component.args, envs
-                    ),
-                );
-            }
-            let state = services::start_component(bundle_root, &component, &envs)?;
-            println!("{}: {:?}", component.id, state);
-            let log_path = paths.log_path(&component.id);
-            service_tracker
-                .record_with_log(component.id.clone(), "component", Some(log_path.as_path()))
-                .with_context(|| format!("failed to record component {}", component.id))?;
-            let pid = read_pid(&paths.pid_path(&component.id))?;
-            let mut summary = ServiceSummary::new(component.id.clone(), pid);
-            summary.add_detail(format!("state={:?}", state));
-            summary.add_detail(format!("log={}", log_path.display()));
-            service_summaries.push(summary);
-        }
-    } else {
-        println!("events: skipped (disabled or no providers)");
-    }
+    println!("events: handled in-process (HTTP ingress + timer scheduler)");
     print_service_summary(&service_summaries);
 
     if !run_gsm_services {
@@ -597,22 +565,6 @@ pub fn demo_up(
     }
 
     Ok(())
-}
-
-fn build_env_kv(
-    tenant: &str,
-    team: Option<&str>,
-    nats_url: Option<&str>,
-) -> Vec<(&'static str, String)> {
-    let mut envs = Vec::new();
-    envs.push(("GREENTIC_TENANT", tenant.to_string()));
-    if let Some(team) = team {
-        envs.push(("GREENTIC_TEAM", team.to_string()));
-    }
-    if let Some(nats_url) = nats_url {
-        envs.push(("NATS_URL", nats_url.to_string()));
-    }
-    envs
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -742,36 +694,10 @@ pub fn demo_up_services(
         None
     };
 
-    let events_enabled = config
-        .services
-        .events
-        .enabled
-        .is_enabled(discovery.domains.events);
-    if events_enabled {
-        for component in &config.services.events.components {
-            if should_restart(restart, &component.id) {
-                let _ = supervisor::stop_pidfile(&paths.pid_path(&component.id), 2_000);
-            }
-            let spec = build_service_spec(
-                config_dir,
-                dev_settings.as_ref(),
-                &component.id,
-                &component.binary,
-                &component.args,
-                &build_env(
-                    tenant,
-                    team,
-                    nats_url.as_deref(),
-                    public_base_url.as_deref(),
-                ),
-            )?;
-            if let Some(handle) = spawn_if_needed(&paths, &spec, restart, None)? {
-                service_tracker
-                    .record_with_log(component.id.clone(), "component", Some(&handle.log_path))
-                    .with_context(|| format!("failed to record {}", component.id))?;
-            }
-        }
-    }
+    operator_log::info(
+        module_path!(),
+        "events provider packs run in-process; external events components are disabled",
+    );
 
     if should_restart(restart, "gateway") {
         let _ = supervisor::stop_pidfile(&paths.pid_path("gateway"), 2_000);

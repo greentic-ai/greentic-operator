@@ -414,16 +414,5 @@ fn default_msgraph_mode() -> String {
 }
 
 pub(crate) fn default_events_components() -> Vec<ServiceComponentConfig> {
-    vec![
-        ServiceComponentConfig {
-            id: "events-ingress".to_string(),
-            binary: "greentic-events-ingress".to_string(),
-            args: Vec::new(),
-        },
-        ServiceComponentConfig {
-            id: "events-worker".to_string(),
-            binary: "greentic-events-worker".to_string(),
-            args: Vec::new(),
-        },
-    ]
+    Vec::new()
 }

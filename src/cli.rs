@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::TryFrom,
     env, fs,
-    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -10,13 +9,11 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use chrono::{TimeZone, Utc};
-use futures_util::StreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
-use base64::{Engine as _, engine::general_purpose};
+use base64::Engine as _;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
 
 use crate::bin_resolver::{self, ResolveCtx};
 use crate::config;
@@ -28,6 +25,7 @@ use crate::demo::{
     input as demo_input, pack_resolve,
     runner_host::{DemoRunnerHost, FlowOutcome, OperatorContext, primary_provider_type},
     setup::{ProvidersInput, discover_tenants},
+    timer_scheduler::{TimerScheduler, TimerSchedulerConfig, discover_timer_handlers},
 };
 use crate::dev_mode::{
     DevCliOverrides, DevMode, DevProfile, DevSettingsResolved, effective_dev_settings,
@@ -134,7 +132,6 @@ enum DemoSubcommand {
     Start(DemoUpArgs),
     Setup(DemoSetupArgs),
     Send(DemoSendArgs),
-    Receive(DemoReceiveArgs),
     #[command(about = "Send a synthetic HTTP request through the messaging ingress pipeline")]
     Ingress(DemoIngressArgs),
     New(DemoNewArgs),
@@ -941,36 +938,6 @@ struct DemoSendArgs {
 
 #[derive(Parser)]
 #[command(
-    about = "Stream inbound messaging ingress events from a demo bundle.",
-    long_about = "Subscribes to the bundle's domain-specific ingress subjects, prints each event, and appends the same data to incoming.log.",
-    after_help = "Main options:\n  --bundle <DIR> --provider <PROVIDER>|--all --tenant <TENANT> --team <TEAM>\n\nOptional options:\n  --domain <messaging|events> (default: messaging)\n  --nats-url <URL> (default: nats://127.0.0.1:4222)"
-)]
-struct DemoReceiveArgs {
-    #[arg(long)]
-    bundle: PathBuf,
-    #[arg(long, conflicts_with = "all")]
-    provider: Option<String>,
-    #[arg(long, conflicts_with = "provider")]
-    all: bool,
-    #[arg(long)]
-    nats_url: Option<String>,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = DomainArg::Messaging,
-        help = "Domain for the ingress subject (messaging or events)."
-    )]
-    domain: DomainArg,
-    #[arg(long, default_value = "demo")]
-    tenant: String,
-    #[arg(long, default_value = "default")]
-    team: String,
-    #[arg(long)]
-    runner_binary: Option<PathBuf>,
-}
-
-#[derive(Parser)]
-#[command(
     about = "Manage demo subscriptions via provider components.",
     long_about = "Ensure, renew, or delete provider-managed subscriptions from a demo bundle."
 )]
@@ -1680,7 +1647,6 @@ impl DemoCommand {
             DemoSubcommand::Start(args) => args.run_start(ctx),
             DemoSubcommand::Setup(args) => args.run(),
             DemoSubcommand::Send(args) => args.run(),
-            DemoSubcommand::Receive(args) => args.run(),
             DemoSubcommand::Ingress(args) => args.run(),
             DemoSubcommand::New(args) => args.run(),
             DemoSubcommand::Status(args) => args.run(),
@@ -1810,7 +1776,7 @@ impl DevUpArgs {
     fn run(self, ctx: &AppCtx) -> anyhow::Result<()> {
         let root = project_root(self.project_root)?;
         let config = config::load_operator_config(&root)?;
-        let dev_settings = resolve_dev_settings(&ctx.settings, config.as_ref(), &self.dev, &root)?;
+        let _ = resolve_dev_settings(&ctx.settings, config.as_ref(), &self.dev, &root)?;
         let discovery = discovery::discover(&root)?;
         discovery::persist(&root, &self.tenant, &discovery)?;
         let services = config
@@ -1823,30 +1789,17 @@ impl DevUpArgs {
             .is_enabled(discovery.domains.messaging);
         let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
 
-        let mut nats_url = self.nats_url.clone();
-        let default_nats_url = config::default_nats_url();
         let mut nats_started = false;
-        if !self.no_nats && nats_url.is_none() && (messaging_enabled || events_enabled) {
+        if !self.no_nats && self.nats_url.is_none() && (messaging_enabled || events_enabled) {
             if let Err(err) = crate::services::start_nats(&root) {
                 eprintln!("Warning: failed to start NATS: {err}");
             } else {
-                nats_url = Some(crate::services::nats_url(&root));
                 nats_started = true;
             }
         }
-        if !self.no_nats && nats_url.is_none() {
-            nats_url = Some(default_nats_url);
-        }
 
-        let mut event_specs = Vec::new();
         if events_enabled {
-            let envs = build_domain_env(&self.tenant, self.team.as_deref(), nats_url.as_deref());
-            for spec in resolve_event_components(&root, config.as_ref(), &services, &dev_settings)?
-            {
-                let state = crate::services::start_component(&root, &spec, &envs)?;
-                println!("{}: {:?}", spec.id, state);
-                event_specs.push(spec);
-            }
+            println!("events: enabled (in-process via operator ingress + timer scheduler)");
         } else {
             println!("events: skipped (disabled or no providers)");
         }
@@ -1857,12 +1810,6 @@ impl DevUpArgs {
             );
         } else {
             println!("messaging: skipped (disabled or no providers)");
-        }
-
-        for spec in event_specs {
-            let id = spec.id.clone();
-            let state = crate::services::stop_component(&root, &id)?;
-            println!("{id}: {:?}", state);
         }
 
         if nats_started {
@@ -1877,19 +1824,8 @@ impl DevUpArgs {
 impl DevDownArgs {
     fn run(self) -> anyhow::Result<()> {
         let root = project_root(self.project_root)?;
-        let config = config::load_operator_config(&root)?;
-        let services = config
-            .as_ref()
-            .and_then(|config| config.services.clone())
-            .unwrap_or_default();
-        println!(
-            "messaging: runtime managed by `demo start`/`demo down`; `dev` commands now only handle events + NATS."
-        );
-
-        for id in event_component_ids(&services) {
-            let state = crate::services::stop_component(&root, &id)?;
-            println!("{id}: {:?}", state);
-        }
+        println!("messaging: runtime managed by `demo start`/`demo down`.");
+        println!("events: runtime handled in-process (nothing to stop).");
 
         if !self.no_nats {
             let nats = crate::services::stop_nats(&root)?;
@@ -1932,10 +1868,7 @@ impl DevStatusArgs {
         }
 
         if events_enabled {
-            for id in event_component_ids(&services) {
-                let status = crate::services::component_status(&root, &id)?;
-                println!("{id}: {:?}", status);
-            }
+            println!("events: enabled (in-process via operator ingress + timer scheduler)");
         } else {
             println!("events: skipped (disabled or no providers)");
         }
@@ -2200,8 +2133,7 @@ impl DemoUpArgs {
                 .clone()
                 .unwrap_or_else(|| DEMO_DEFAULT_TENANT.to_string());
             let config = config::load_operator_config(&bundle)?;
-            let dev_settings =
-                resolve_dev_settings(&ctx.settings, config.as_ref(), &self.dev, &bundle)?;
+            let _ = resolve_dev_settings(&ctx.settings, config.as_ref(), &self.dev, &bundle)?;
             domains::ensure_cbor_packs(&bundle)?;
             let discovery = discovery::discover_with_options(
                 &bundle,
@@ -2228,12 +2160,6 @@ impl DemoUpArgs {
                 .messaging
                 .enabled
                 .is_enabled(discovery.domains.messaging);
-            let events_enabled = services.events.enabled.is_enabled(discovery.domains.events);
-            let events_components = if events_enabled {
-                resolve_event_components(&bundle, config.as_ref(), &services, &dev_settings)?
-            } else {
-                Vec::new()
-            };
             let explicit_nats_url = self.nats_url.clone();
             let domains_to_setup = self.domain.resolve_domains(Some(&discovery));
 
@@ -2336,7 +2262,6 @@ impl DemoUpArgs {
                             nats_mode,
                             messaging_enabled,
                             cloudflared_config.clone(),
-                            events_components.clone(),
                             &log_dir,
                             debug_enabled,
                         )
@@ -2366,6 +2291,7 @@ impl DemoUpArgs {
                 guard
             };
             let mut ingress_server = None;
+            let mut timer_scheduler = None;
             if start_result.is_ok() {
                 let ingress_secrets_handle =
                     secrets_gate::resolve_secrets_manager(&bundle, &tenant, self.team.as_deref())?;
@@ -2391,6 +2317,29 @@ impl DemoUpArgs {
                         operator_log::warn(
                             module_path!(),
                             format!("demo ingress server unavailable: {err}"),
+                        );
+                    }
+                }
+                match start_demo_timer_scheduler(
+                    &bundle,
+                    &discovery,
+                    &domains_to_setup,
+                    self.runner_binary.clone(),
+                    debug_enabled,
+                    ingress_secrets_handle.clone(),
+                    &tenant,
+                    self.team.as_deref().unwrap_or(DEMO_DEFAULT_TEAM),
+                ) {
+                    Ok(Some(scheduler)) => {
+                        println!("events timer scheduler ready");
+                        timer_scheduler = Some(scheduler);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!("Warning: events timer scheduler disabled: {err}");
+                        operator_log::warn(
+                            module_path!(),
+                            format!("demo timer scheduler unavailable: {err}"),
                         );
                     }
                 }
@@ -2423,6 +2372,9 @@ impl DemoUpArgs {
                 wait_for_ctrlc()?;
                 if let Some(server) = ingress_server.take() {
                     server.stop()?;
+                }
+                if let Some(scheduler) = timer_scheduler.take() {
+                    scheduler.stop()?;
                 }
                 for target in run_targets.iter().rev() {
                     demo::demo_down_runtime(&state_dir, &target.tenant, target.team_id(), false)?;
@@ -2481,6 +2433,7 @@ impl DemoUpArgs {
         };
 
         let provider_setup_input = self.setup_input.clone();
+        let timer_runner_binary = self.runner_binary.clone();
         let provider_options = crate::providers::ProviderSetupOptions {
             providers: if self.providers.is_empty() {
                 None
@@ -2517,6 +2470,30 @@ impl DemoUpArgs {
             operator_log::info(module_path!(), "{command_label} services completed");
         }
         if result.is_ok() {
+            let is_demo_bundle = config_dir.join("greentic.demo.yaml").exists();
+            let discovery = discovery::discover_with_options(
+                &config_dir,
+                discovery::DiscoveryOptions {
+                    cbor_only: is_demo_bundle,
+                },
+            )?;
+            let domains = if discovery.domains.events {
+                vec![Domain::Events]
+            } else {
+                Vec::new()
+            };
+            let timer_secrets_handle =
+                secrets_gate::resolve_secrets_manager(&config_dir, &tenant, Some(&team))?;
+            let timer_scheduler = start_demo_timer_scheduler(
+                &config_dir,
+                &discovery,
+                &domains,
+                timer_runner_binary.clone(),
+                debug_enabled,
+                timer_secrets_handle,
+                &tenant,
+                &team,
+            )?;
             println!(
                 "{command_label} running (config={} tenant={} team={}); press Ctrl+C to stop",
                 config_path.display(),
@@ -2524,6 +2501,9 @@ impl DemoUpArgs {
                 team
             );
             wait_for_ctrlc()?;
+            if let Some(scheduler) = timer_scheduler {
+                scheduler.stop()?;
+            }
             demo::demo_down_runtime(&state_dir, &tenant, &team, false)?;
         }
         result
@@ -3242,86 +3222,6 @@ fn ensure_provider_op_success(
     Err(anyhow::anyhow!("{provider_id}.{op} failed: {message}"))
 }
 
-impl DemoReceiveArgs {
-    fn run(self) -> anyhow::Result<()> {
-        let team_context = if self.team.is_empty() {
-            None
-        } else {
-            Some(self.team.clone())
-        };
-        let (providers, discovery) =
-            discover_demo_messaging_providers(&self.bundle, &self.tenant, team_context.as_deref())?;
-        if providers.is_empty() {
-            return Err(anyhow::anyhow!(
-                "no messaging providers found in bundle {}",
-                self.bundle.display()
-            ));
-        }
-        let selected = select_demo_providers(&providers, self.provider.as_deref())?;
-        let provider_ids = selected
-            .iter()
-            .map(|info| info.provider_id.clone())
-            .collect::<BTreeSet<_>>();
-        let filter_active = self.provider.is_some();
-        let log_dir = resolve_log_dir(None, Some(&self.bundle));
-        std::fs::create_dir_all(&log_dir)?;
-        let log_path = log_dir.join("incoming.log");
-        println!("listening for inbound events via {}", log_path.display());
-        println!(
-            "providers: {}",
-            selected
-                .iter()
-                .map(|info| info.provider_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let env_name = env::var("GREENTIC_ENV").unwrap_or_else(|_| "demo".to_string());
-        let domain = Domain::from(self.domain);
-        let subject_filter =
-            ingress_subject_filter(&env_name, &self.tenant, self.team.as_str(), domain);
-        let mut nats_urls = Vec::new();
-        if let Some(url) = self.nats_url.clone() {
-            nats_urls.push(url);
-        } else {
-            nats_urls.push(config::default_nats_url());
-        }
-        let log_file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let log_writer = Arc::new(Mutex::new(std::io::BufWriter::new(log_file)));
-        let secrets_handle = secrets_gate::resolve_secrets_manager(
-            &self.bundle,
-            &self.tenant,
-            team_context.as_deref(),
-        )?;
-        let runner_host = Arc::new(DemoRunnerHost::new(
-            self.bundle.clone(),
-            &discovery,
-            self.runner_binary.clone(),
-            secrets_handle.clone(),
-            false,
-        )?);
-        let context = OperatorContext {
-            tenant: self.tenant.clone(),
-            team: team_context.clone(),
-            correlation_id: None,
-        };
-        let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(run_demo_receive_async(
-            nats_urls,
-            subject_filter,
-            provider_ids,
-            filter_active,
-            log_writer,
-            runner_host,
-            domain,
-            context,
-        ))?;
-        Ok(())
-    }
-}
-
 #[derive(Parser)]
 #[command(
     about = "Send a synthetic HTTP request through the messaging ingress pipeline.",
@@ -3637,41 +3537,13 @@ impl DemoNewArgs {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct DemoProviderInfo {
     pack: domains::ProviderPack,
-    provider_id: String,
 }
 
-fn discover_demo_messaging_providers(
-    bundle: &Path,
-    tenant: &str,
-    team: Option<&str>,
-) -> anyhow::Result<(Vec<DemoProviderInfo>, discovery::DiscoveryResult)> {
-    let is_demo_bundle = bundle.join("greentic.demo.yaml").exists();
-    let mut packs = if is_demo_bundle {
-        domains::discover_provider_packs_cbor_only(bundle, Domain::Messaging)?
-    } else {
-        domains::discover_provider_packs(bundle, Domain::Messaging)?
-    };
-    if is_demo_bundle
-        && let Some(allowed) = demo_provider_files(bundle, tenant, team, Domain::Messaging)?
-    {
-        packs.retain(|pack| allowed.contains(&pack.file_name));
-    }
-    let discovery =
-        discovery::discover_with_options(bundle, discovery::DiscoveryOptions { cbor_only: true })?;
-    let provider_map = discovery_map(&discovery.providers);
-    let entries = packs
-        .into_iter()
-        .map(|pack| DemoProviderInfo {
-            provider_id: provider_id_for_pack(&pack.path, &pack.pack_id, Some(&provider_map)),
-            pack,
-        })
-        .collect();
-    Ok((entries, discovery))
-}
-
+#[cfg(test)]
 fn select_demo_providers(
     providers: &[DemoProviderInfo],
     provider_filter: Option<&str>,
@@ -3695,230 +3567,6 @@ fn select_demo_providers(
         }
     } else {
         Ok(providers.to_vec())
-    }
-}
-
-fn normalized_subject_component(value: &str) -> String {
-    let mut normalized = value
-        .trim()
-        .replace([' ', '\t', '\n', '\r', '*', '>', '/'], "-");
-    if normalized.is_empty() {
-        normalized = "unknown".to_string();
-    }
-    normalized
-}
-
-fn ingress_subject_with_prefix(
-    prefix: &str,
-    env: &str,
-    tenant: &str,
-    team: &str,
-    platform: &str,
-) -> String {
-    format!(
-        "{prefix}.{}.{}.{}.{}",
-        normalized_subject_component(env),
-        normalized_subject_component(tenant),
-        normalized_subject_component(team),
-        normalized_subject_component(platform),
-    )
-}
-
-fn ingress_subject_filter(env: &str, tenant: &str, team: &str, domain: Domain) -> String {
-    let prefix = format!("greentic.{}.ingress", domains::domain_name(domain));
-    let base = ingress_subject_with_prefix(&prefix, env, tenant, team, "__provider__");
-    if let Some(pos) = base.rfind('.') {
-        format!("{}.*", &base[..pos])
-    } else {
-        format!("{}.*", base)
-    }
-}
-
-async fn connect_to_nats(urls: &[String]) -> anyhow::Result<(async_nats::Client, String)> {
-    let mut failures = Vec::new();
-    for url in urls {
-        match async_nats::connect(url).await {
-            Ok(client) => return Ok((client, url.clone())),
-            Err(err) => {
-                eprintln!("failed to connect to {}: {}; trying next", url, err);
-                failures.push(format!("{url}: {err}"));
-            }
-        }
-    }
-    let message = if failures.is_empty() {
-        "no URLs were provided".to_string()
-    } else {
-        failures.join("; ")
-    };
-    Err(anyhow::anyhow!(
-        "unable to connect to any configured NATS URL ({}): {message}",
-        urls.join(", ")
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_demo_receive_async(
-    nats_urls: Vec<String>,
-    subject_filter: String,
-    provider_ids: BTreeSet<String>,
-    filter_active: bool,
-    log_writer: Arc<Mutex<std::io::BufWriter<std::fs::File>>>,
-    runner_host: Arc<DemoRunnerHost>,
-    domain: Domain,
-    context: OperatorContext,
-) -> anyhow::Result<()> {
-    let (client, connected_url) = connect_to_nats(&nats_urls).await?;
-    let mut subscription = client.subscribe(subject_filter.clone()).await?;
-    println!("connected to NATS at {}", connected_url);
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    loop {
-        tokio::select! {
-            _ = &mut ctrl_c => {
-                println!("interrupt received; shutting down receive loop");
-                break;
-            }
-            message = subscription.next() => match message {
-            Some(message) => {
-                    let provider_name = provider_id_from_message(&message.payload);
-                    if !should_log_message(provider_name.as_deref(), &provider_ids, filter_active) {
-                        continue;
-                    }
-                    let provider = match provider_name.as_deref() {
-                        Some(name) => name,
-                        None => continue,
-                    };
-                    let flow_id = if runner_host.supports_op(domain, provider, "handle-webhook") {
-                        "handle-webhook"
-                    } else if runner_host.supports_op(domain, provider, "ingest") {
-                        "ingest"
-                    } else {
-                        println!(
-                            "[warn] provider {} has no ingress flows for domain {}",
-                            provider,
-                            domains::domain_name(domain)
-                        );
-                        continue;
-                    };
-                    let outcome = runner_host.invoke_provider_op(
-                        domain,
-                        provider,
-                        flow_id,
-                        message.payload.as_ref(),
-                        &context,
-                    );
-                    match outcome {
-                        Ok(outcome) if outcome.success => {
-                            if let Some(value) = outcome.output {
-                                println!("{}", serde_json::to_string_pretty(&value)?);
-                            } else if let Some(raw) = outcome.raw {
-                                println!("{raw}");
-                            } else {
-                                println!("{} {} -> success (no output)", provider, flow_id);
-                            }
-                        }
-                        Ok(outcome) => {
-                            println!(
-                                "[error] provider {} {} failed: {}",
-                                provider,
-                                flow_id,
-                                outcome
-                                    .error
-                                    .unwrap_or_else(|| "unknown error".to_string())
-                            );
-                        }
-                        Err(err) => {
-                            println!(
-                                "[error] provider {} {} invocation failed: {err}",
-                                provider, flow_id
-                            );
-                        }
-                    }
-                    let timestamp = Utc::now().to_rfc3339();
-                    let payload_text = format_payload_display(&message.payload);
-                    let headers = format_headers_json(&message.headers);
-                    let entry = json!({
-                        "timestamp": timestamp,
-                        "subject": message.subject.clone(),
-                        "provider": provider_name,
-                        "payload": payload_text,
-                        "headers": headers,
-                    });
-                    let line = serde_json::to_string(&entry)?;
-                    {
-                        let mut writer = log_writer.lock().await;
-                        writeln!(writer, "{line}")?;
-                        writer.flush()?;
-                    }
-                    println!("{line}");
-                }
-                None => {
-                    println!("subscription closed");
-                    break;
-                }
-            }
-        }
-    }
-    subscription.unsubscribe().await?;
-    println!("receive listener stopped (subject={subject_filter})");
-    Ok(())
-}
-
-fn should_log_message(
-    provider_name: Option<&str>,
-    provider_ids: &BTreeSet<String>,
-    filter_active: bool,
-) -> bool {
-    match provider_name {
-        Some(name) => provider_ids.contains(name),
-        None => !filter_active,
-    }
-}
-
-const PROVIDER_ID_KEY: &str = "provider_id";
-
-fn provider_id_from_message(payload: &[u8]) -> Option<String> {
-    let parsed: JsonValue = serde_json::from_slice(payload).ok()?;
-    parsed
-        .get("payload")
-        .and_then(|value| value.get("metadata"))
-        .and_then(|value| value.get(PROVIDER_ID_KEY))
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-}
-
-fn format_payload_display(payload: &[u8]) -> String {
-    match std::str::from_utf8(payload) {
-        Ok(text) => text.to_string(),
-        Err(_) => {
-            let encoded = general_purpose::STANDARD.encode(payload);
-            format!("base64:{encoded}")
-        }
-    }
-}
-
-fn format_headers_json(headers: &Option<async_nats::HeaderMap>) -> Option<JsonValue> {
-    let headers = headers.as_ref()?;
-    let mut map = serde_json::Map::new();
-    for (name, values) in headers.iter() {
-        let key = name.to_string();
-        for value in values {
-            let text = value.to_string();
-            if text.is_empty() {
-                continue;
-            }
-            let entry = map
-                .entry(key.clone())
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-            if let serde_json::Value::Array(array) = entry {
-                array.push(JsonValue::String(text));
-            }
-        }
-    }
-    if map.is_empty() {
-        None
-    } else {
-        Some(JsonValue::Object(map))
     }
 }
 
@@ -4017,6 +3665,46 @@ fn start_demo_ingress_server(
         domains: domains.to_vec(),
         runner_host,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_demo_timer_scheduler(
+    bundle: &Path,
+    discovery: &discovery::DiscoveryResult,
+    domains: &[Domain],
+    runner_binary: Option<PathBuf>,
+    debug_enabled: bool,
+    secrets_handle: SecretsManagerHandle,
+    tenant: &str,
+    team: &str,
+) -> anyhow::Result<Option<TimerScheduler>> {
+    if !domains.contains(&Domain::Events) {
+        return Ok(None);
+    }
+    let default_interval_seconds = std::env::var("GREENTIC_OPERATOR_TIMER_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60)
+        .max(1);
+    let handlers = discover_timer_handlers(discovery, default_interval_seconds)?;
+    if handlers.is_empty() {
+        return Ok(None);
+    }
+    let runner_host = Arc::new(DemoRunnerHost::new(
+        bundle.to_path_buf(),
+        discovery,
+        runner_binary,
+        secrets_handle,
+        debug_enabled,
+    )?);
+    let scheduler = TimerScheduler::start(TimerSchedulerConfig {
+        runner_host,
+        tenant: tenant.to_string(),
+        team: Some(team.to_string()),
+        handlers,
+        debug_enabled,
+    })?;
+    Ok(Some(scheduler))
 }
 
 fn ensure_dir(path: &Path) -> anyhow::Result<()> {
@@ -5258,68 +4946,6 @@ fn extract_config_for_envelope(parsed: Option<&JsonValue>) -> Option<JsonValue> 
     Some(value.clone())
 }
 
-fn build_domain_env(
-    tenant: &str,
-    team: Option<&str>,
-    nats_url: Option<&str>,
-) -> Vec<(&'static str, String)> {
-    let mut envs = Vec::new();
-    envs.push(("GREENTIC_TENANT", tenant.to_string()));
-    if let Some(team) = team {
-        envs.push(("GREENTIC_TEAM", team.to_string()));
-    }
-    if let Some(nats_url) = nats_url {
-        envs.push(("NATS_URL", nats_url.to_string()));
-    }
-    envs
-}
-
-fn event_component_ids(services: &config::OperatorServicesConfig) -> Vec<String> {
-    event_components(services)
-        .into_iter()
-        .map(|component| component.id)
-        .collect()
-}
-
-fn resolve_event_components(
-    root: &Path,
-    config: Option<&config::OperatorConfig>,
-    services: &config::OperatorServicesConfig,
-    dev_settings: &Option<DevSettingsResolved>,
-) -> anyhow::Result<Vec<crate::services::ComponentSpec>> {
-    let mut specs = Vec::new();
-    for component in event_components(services) {
-        let explicit = if looks_like_path_str(&component.binary) {
-            Some(PathBuf::from(&component.binary))
-        } else {
-            config::binary_override(config, &component.binary, root)
-        };
-        let resolved = bin_resolver::resolve_binary(
-            &component.binary,
-            &ResolveCtx {
-                config_dir: root.to_path_buf(),
-                dev: dev_settings.clone(),
-                explicit_path: explicit,
-            },
-        )?;
-        specs.push(crate::services::ComponentSpec {
-            id: component.id,
-            binary: resolved.to_string_lossy().to_string(),
-            args: component.args,
-        });
-    }
-    Ok(specs)
-}
-
-fn event_components(
-    services: &config::OperatorServicesConfig,
-) -> Vec<config::ServiceComponentConfig> {
-    if services.events.components.is_empty() {
-        return config::default_events_components();
-    }
-    services.events.components.clone()
-}
-
 pub(crate) fn provider_id_for_pack(
     pack_path: &Path,
     fallback: &str,
@@ -5765,40 +5391,9 @@ mod tests {
     }
 
     #[test]
-    fn demo_receive_args_provider_all_conflict() {
-        let result = DemoReceiveArgs::try_parse_from(&[
-            "greentic-operator",
-            "--bundle",
-            ".",
-            "--provider",
-            "messaging-telegram",
-            "--all",
-        ]);
-        assert!(result.is_err(), "provider and all should conflict");
-    }
-
-    #[test]
-    fn ingress_subject_filter_slices_platform() {
-        let env = "dev env";
-        let tenant = "acme tenant";
-        let team = "team/with slash";
-        let domain = Domain::Messaging;
-        let filter = ingress_subject_filter(env, tenant, team, domain);
-        let prefix = format!("greentic.{}.ingress", domains::domain_name(domain));
-        let base = ingress_subject_with_prefix(&prefix, env, tenant, team, "__provider__");
-        let expected = if let Some(pos) = base.rfind('.') {
-            format!("{}.*", &base[..pos])
-        } else {
-            format!("{}.*", base)
-        };
-        assert_eq!(filter, expected);
-    }
-
-    #[test]
     fn select_demo_providers_respects_filter() {
         let providers = vec![
             DemoProviderInfo {
-                provider_id: "messaging-telegram".to_string(),
                 pack: domains::ProviderPack {
                     pack_id: "messaging-telegram".to_string(),
                     file_name: "messaging-telegram.gtpack".to_string(),
@@ -5807,7 +5402,6 @@ mod tests {
                 },
             },
             DemoProviderInfo {
-                provider_id: "messaging-slack".to_string(),
                 pack: domains::ProviderPack {
                     pack_id: "messaging-slack".to_string(),
                     file_name: "messaging-slack.gtpack".to_string(),
@@ -5820,6 +5414,6 @@ mod tests {
         assert_eq!(all.len(), providers.len());
         let single = select_demo_providers(&providers, Some("messaging-slack")).unwrap();
         assert_eq!(single.len(), 1);
-        assert_eq!(single[0].provider_id, "messaging-slack");
+        assert_eq!(single[0].pack.pack_id, "messaging-slack");
     }
 }

@@ -25,19 +25,10 @@ fn dev_up_starts_events_only_when_events_packs_present() {
     std::fs::create_dir_all(&providers).unwrap();
     write_pack(&providers.join("events.gtpack"), "events-pack").unwrap();
 
-    let config = format!(
-        r#"services:
+    let config = r#"services:
   events:
     enabled: auto
-    components:
-      - id: events-ingress
-        binary: "{ingress}"
-      - id: events-worker
-        binary: "{worker}"
-"#,
-        ingress = fake_bin("fake_events_ingress").display(),
-        worker = fake_bin("fake_events_worker").display(),
-    );
+"#;
     std::fs::write(root.join("greentic.yaml"), config).unwrap();
 
     let output = Command::new(fake_bin("greentic-operator"))
@@ -54,8 +45,9 @@ fn dev_up_starts_events_only_when_events_packs_present() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("events-ingress: Started"));
-    assert!(stdout.contains("events-worker: Started"));
+    assert!(stdout.contains("events: enabled (in-process via operator ingress + timer scheduler)"));
+    assert!(!stdout.contains("events-ingress: Started"));
+    assert!(!stdout.contains("events-worker: Started"));
 
     let messaging_pid = root.join("state").join("pids").join("messaging-demo.pid");
     assert!(!messaging_pid.exists());

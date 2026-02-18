@@ -153,7 +153,10 @@ impl DemoRunnerHost {
     pub fn supports_op(&self, domain: Domain, provider_type: &str, op_id: &str) -> bool {
         self.catalog
             .get(&(domain, provider_type.to_string()))
-            .map(|pack| pack.entry_flows.iter().any(|flow| flow == op_id))
+            .map(|pack| {
+                pack.entry_flows.iter().any(|flow| flow == op_id)
+                    || pack_supports_provider_op(&pack.path, op_id).unwrap_or(false)
+            })
             .unwrap_or(false)
     }
 
@@ -587,6 +590,28 @@ fn validate_runner_binary(path: PathBuf) -> Option<PathBuf> {
             None
         }
     }
+}
+
+fn pack_supports_provider_op(pack_path: &Path, op_id: &str) -> anyhow::Result<bool> {
+    let file = std::fs::File::open(pack_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
+        anyhow!(
+            "failed to open manifest.cbor in {}: {err}",
+            pack_path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    manifest_entry.read_to_end(&mut bytes)?;
+    let manifest = decode_pack_manifest(&bytes)
+        .context("failed to decode pack manifest for op support introspection")?;
+    let Some(provider_ext) = manifest.provider_extension_inline() else {
+        return Ok(false);
+    };
+    Ok(provider_ext
+        .providers
+        .iter()
+        .any(|provider| provider.ops.iter().any(|op| op == op_id)))
 }
 
 #[cfg(unix)]

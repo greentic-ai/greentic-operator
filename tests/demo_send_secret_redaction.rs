@@ -8,8 +8,7 @@ use greentic_operator::secrets_manager;
 use greentic_secrets_lib::{
     ApplyOptions, DevStore, SecretFormat, SeedDoc, SeedEntry, SeedValue, apply_seed,
 };
-use rand::TryRngCore;
-use rand::rngs::OsRng;
+use rand::RngExt;
 use serde_cbor::to_vec;
 use serde_json::json;
 use std::fs;
@@ -90,8 +89,7 @@ fn demo_send_redacts_runtime_secret_values() -> Result<()> {
 
 fn generate_test_secret() -> String {
     let mut bytes = [0u8; 32];
-    let mut rng = OsRng;
-    rng.try_fill_bytes(&mut bytes).expect("OsRng fill failed");
+    rand::rng().fill(&mut bytes);
     let encoded = URL_SAFE_NO_PAD.encode(bytes);
     format!("TEST_OPAQUE_{encoded}")
 }
